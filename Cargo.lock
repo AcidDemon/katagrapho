@@ -504,6 +504,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b3f7cef34251886990511df1c61443aa928499d598a9473929ab5a90a527304"
 
 [[package]]
+name = "katagrapho"
+version = "0.3.0"
+dependencies = [
+ "age",
+ "libc",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -870,14 +878,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "session-writer"
-version = "0.2.0"
-dependencies = [
- "age",
- "libc",
 ]
 
 [[package]]
