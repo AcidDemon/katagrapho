@@ -1,41 +1,42 @@
-# session-writer
+# katagrapho
 
-Minimal Rust binary for tamper-proof SSH session recording. Runs setuid+setgid so that recorded users **cannot modify or delete** their own session files.
+Setuid+setgid binary for tamper-proof session recording with age encryption. Reads asciicinema data from stdin, encrypts it, and writes to files that the recorded user **cannot modify or delete**.
+
+Named after the Greek *katagrapho* (to write down/record) — the process that commits every session to disk.
 
 ## How it works
 
-`session-writer` reads stdin and writes it to `/var/log/ssh-sessions/<user>/<session-id><suffix>`. It is installed as a setuid+setgid binary owned by a dedicated `session-writer` user and `ssh-sessions` group. Files are created mode `0440` — the recorded user has no ownership and cannot `chmod`, overwrite, or unlink them.
+`katagrapho` reads stdin and writes to `/var/log/ssh-sessions/<user>/<session-id>.cast.age`. It runs setuid as a dedicated `session-writer` user and setgid as `ssh-sessions`. Files are created mode `0440` — the recorded user has no ownership and cannot `chmod`, overwrite, or unlink them.
 
 Key properties:
-- Single dependency (`libc`) — minimal attack surface
-- No `unsafe` beyond FFI calls to POSIX APIs (`openat`, `getpwuid`, `umask`)
-- Race-free file creation via `openat()` with `O_CREAT|O_EXCL|O_NOFOLLOW`
-- Atomic directory creation with correct permissions via `mkdir(2)` mode
-- Username resolved from kernel-provided real UID, not caller arguments
-- Environment sanitized at startup (LD_PRELOAD, etc.)
-- 512 MiB per-session size limit, partial file cleanup on error
-- Full RELRO, PIE, overflow checks enabled
+
+- **Streaming age encryption** via the `age` crate — data is encrypted as it arrives, never buffered in plaintext
+- **Encryption enforced by default** — refuses to run without `--recipient-file` (explicit `--no-encrypt` required for plaintext)
+- **Partial file preservation** — interrupted recordings are kept as evidence, not deleted
+- **Termination markers** — writes an asciicinema `"x"` event on abnormal interruption
+- **Race-free file creation** via `openat()` with `O_CREAT|O_EXCL|O_NOFOLLOW`
+- **Username from kernel** — resolved from real UID via `getpwuid()`, not caller arguments
+- **Environment sanitized** — `LD_PRELOAD`, `LD_LIBRARY_PATH`, etc. stripped at startup
+- **512 MiB per-session size limit**
+- **Full RELRO, PIE, overflow checks**
 
 ## Installation (NixOS)
-
-Add the flake to your inputs and import the module:
 
 ```nix
 # flake.nix
 {
-  inputs.session-writer.url = "github:youruser/session-writer";
+  inputs.katagrapho.url = "github:AcidDemon/katagrapho";
 
-  outputs = { self, nixpkgs, session-writer, ... }: {
+  outputs = { self, nixpkgs, katagrapho, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
       modules = [
-        session-writer.nixosModules.default
+        katagrapho.nixosModules.default
         {
-          services.session-writer = {
+          services.katagrapho = {
             enable = true;
-            # Optional: adjust log rotation
-            logRotation.maxAgeDays = 90;
-            # Optional: install record-session helper for authorized_keys
-            ssh.authorizedKeysIntegration = true;
+            encryption.recipientFile = "/etc/age/session-recording.pub";
+            # encryption.required = true;  # default
+            # logRotation.maxAgeDays = 90;  # default
           };
         }
       ];
@@ -44,25 +45,43 @@ Add the flake to your inputs and import the module:
 }
 ```
 
-This creates the `session-writer` user, `ssh-sessions` group, storage directory, setuid/setgid wrapper at `/run/wrappers/bin/session-writer`, and a weekly cleanup timer.
+This creates the `session-writer` user, `ssh-sessions` group, storage directory, setuid/setgid wrapper at `/run/wrappers/bin/katagrapho`, and a weekly cleanup timer.
 
 ## Usage
 
-Pipe session data into the binary:
+Designed to be spawned by [epitropos](https://github.com/AcidDemon/epitropos) (the PTY-proxy), but can also be used standalone:
 
 ```sh
-some-session-source | /run/wrappers/bin/session-writer --session-id <ID> [--suffix .cast.age]
+# With encryption (default)
+some-source | /run/wrappers/bin/katagrapho --session-id <ID> --recipient-file /etc/age/recipients.txt
+
+# Without encryption (must be explicit)
+some-source | /run/wrappers/bin/katagrapho --session-id <ID> --no-encrypt
 ```
 
 The username is determined automatically from the calling process UID.
 
-### Per-key recording with authorized_keys
+## Architecture
 
-With `ssh.authorizedKeysIntegration = true`, a `record-session` helper is installed. Use it in `~/.ssh/authorized_keys`:
+`katagrapho` is one half of a two-component system:
+
+| Component | Role |
+|---|---|
+| **[epitropos](https://github.com/AcidDemon/epitropos)** | PTY proxy — PAM-triggered, owns the terminal, generates asciicinema v2 |
+| **katagrapho** | Storage writer — encrypts with age, writes tamper-proof files |
+
+IPC is a stdin pipe. `epitropos` spawns `katagrapho` as a child process and pipes the asciicinema stream to it.
+
+## Permission model
 
 ```
-command="/run/current-system/sw/bin/record-session" ssh-ed25519 AAAA...
+/var/log/ssh-sessions/              session-writer:ssh-sessions  2770
+/var/log/ssh-sessions/<user>/       session-writer:ssh-sessions  0750
+/var/log/ssh-sessions/<user>/*.age  session-writer:ssh-sessions  0440
+/run/wrappers/bin/katagrapho        session-writer:ssh-sessions  setuid+setgid
 ```
+
+The recorded user owns nothing in this chain. Only `root` and members of `ssh-sessions` can read the recordings.
 
 ## Building from source
 
@@ -76,16 +95,10 @@ cargo build --release
 
 Requires Rust >= 1.85 (edition 2024).
 
-## Permission model
+## Dependencies
 
-```
-/var/log/ssh-sessions/              session-writer:ssh-sessions  2770
-/var/log/ssh-sessions/<user>/       session-writer:ssh-sessions  2750
-/var/log/ssh-sessions/<user>/*.age  session-writer:ssh-sessions  0440
-/run/wrappers/bin/session-writer    session-writer:ssh-sessions  setuid+setgid
-```
-
-The recorded user owns nothing in this chain. Only `root` and members of `ssh-sessions` can read the recordings.
+- `libc` — POSIX syscalls (`openat`, `getpwuid`, `umask`)
+- `age` — streaming age encryption (pure Rust)
 
 ## License
 
