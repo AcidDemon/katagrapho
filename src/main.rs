@@ -128,8 +128,8 @@ fn validate_directory(path: &Path) -> Result<(), String> {
 /// Load age recipients (public keys) from a file.
 /// Each line is either an age public key or a comment (starting with #).
 fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, String> {
-    let contents =
-        fs::read_to_string(path).map_err(|e| format!("cannot read recipient file '{path}': {e}"))?;
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("cannot read recipient file '{path}': {e}"))?;
 
     let recipients: Vec<Box<dyn age::Recipient + Send>> = contents
         .lines()
@@ -255,13 +255,21 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!("{} requires a value", args[i]));
             }
             "--help" | "-h" => {
-                eprintln!("Usage: katagrapho --session-id <ID> (--recipient-file <FILE> | --no-encrypt) [--suffix <SUFFIX>]");
+                eprintln!(
+                    "Usage: katagrapho --session-id <ID> (--recipient-file <FILE> | --no-encrypt) [--suffix <SUFFIX>]"
+                );
                 eprintln!("Username is resolved automatically from the calling process UID.");
                 eprintln!();
                 eprintln!("  --session-id <ID>         Session identifier (required)");
-                eprintln!("  --recipient-file <FILE>   Path to age recipients file (required unless --no-encrypt)");
-                eprintln!("  --no-encrypt              Disable encryption; write plaintext .cast file");
-                eprintln!("  --suffix <SUFFIX>         Override output file suffix (default: .cast.age or .cast with --no-encrypt)");
+                eprintln!(
+                    "  --recipient-file <FILE>   Path to age recipients file (required unless --no-encrypt)"
+                );
+                eprintln!(
+                    "  --no-encrypt              Disable encryption; write plaintext .cast file"
+                );
+                eprintln!(
+                    "  --suffix <SUFFIX>         Override output file suffix (default: .cast.age or .cast with --no-encrypt)"
+                );
                 process::exit(0);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -390,10 +398,12 @@ fn run() -> Result<(), String> {
 
     let result = if let Some(ref recipient_path) = args.recipient_file {
         let recipients = load_recipients(recipient_path)?;
-        let recipients_ref: Vec<&dyn age::Recipient> =
-            recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient).collect();
+        let recipients_ref: Vec<&dyn age::Recipient> = recipients
+            .iter()
+            .map(|r| r.as_ref() as &dyn age::Recipient)
+            .collect();
         let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
-        .map_err(|e| format!("encryption setup: {e}"))?;
+            .map_err(|e| format!("encryption setup: {e}"))?;
         let mut encrypt_writer = encryptor
             .wrap_output(&mut file)
             .map_err(|e| format!("encryption init: {e}"))?;
