@@ -52,9 +52,8 @@
 
             # Security hardening via linker flags.
             RUSTFLAGS = builtins.concatStringsSep " " [
-              "-C link-arg=-Wl,-z,relro,-z,now" # Full RELRO
-              "-C link-arg=-pie" # Position-independent executable
-              "-C panic=abort" # Belt-and-suspenders (also in Cargo.toml)
+              "-C link-arg=-Wl,-z,relro,-z,now"
+              "-C panic=abort"
             ];
           };
 
