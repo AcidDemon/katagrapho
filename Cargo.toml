@@ -1,0 +1,18 @@
+[package]
+name = "katagrapho"
+version = "0.3.0"
+edition = "2024"
+description = "Setgid+setuid binary for tamper-proof session recording with age encryption"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+age = { version = "0.11", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+overflow-checks = true
