@@ -128,7 +128,7 @@ in
       description = "Clean up old session recordings";
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${pkgs.findutils}/bin/find ${cfg.storageDir} -type f -mtime +${toString cfg.logRotation.maxAgeDays} -delete";
+        ExecStart = "${pkgs.findutils}/bin/find -P ${cfg.storageDir} -maxdepth 2 -type f -not -type l -mtime +${toString cfg.logRotation.maxAgeDays} -delete";
         ProtectSystem = "strict";
         ReadWritePaths = [ cfg.storageDir ];
         ProtectHome = true;

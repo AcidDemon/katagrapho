@@ -11,6 +11,13 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -147,6 +154,9 @@ fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, Stri
     let mut total_read: u64 = 0;
 
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break;
+        }
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
@@ -283,9 +293,20 @@ fn parse_args() -> Result<Args, String> {
 // Core logic
 // ---------------------------------------------------------------------------
 
+fn install_signal_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    }
+}
+
 fn run() -> Result<(), String> {
     sanitize_environment();
     set_umask();
+    install_signal_handlers();
 
     let args = parse_args()?;
 
