@@ -112,7 +112,7 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.storageDir} 2770 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.storageDir} 2750 ${cfg.user} ${cfg.group} -"
     ];
 
     security.wrappers.katagrapho = {

@@ -29,26 +29,14 @@ const SAFE_SUFFIX_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 // Security initialization
 // ---------------------------------------------------------------------------
 
-/// Sanitize the process environment for setuid/setgid execution.
-/// Must be called before any other work.
 fn sanitize_environment() {
-    // These variables can influence the dynamic linker or Rust runtime.
-    // While the kernel sets AT_SECURE for setuid/setgid binaries (causing
-    // glibc to ignore LD_* vars), we clear them defensively in case the
-    // binary is invoked through a code path that does not trigger AT_SECURE.
-    for key in &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
-        "LD_DEBUG",
-        "LD_PROFILE",
-        "LD_SHOW_AUXV",
-        "LD_DYNAMIC_WEAK",
-        "RUST_BACKTRACE",
-        "RUST_LOG",
-    ] {
-        // SAFETY: We are single-threaded at this point (start of main).
-        unsafe { std::env::remove_var(key) };
+    // Allowlist: nuke everything, keep only PATH.
+    let path = std::env::var("PATH").ok();
+    for (key, _) in std::env::vars_os() {
+        unsafe { std::env::remove_var(&key) };
+    }
+    if let Some(p) = path {
+        unsafe { std::env::set_var("PATH", p) };
     }
 }
 
@@ -140,7 +128,7 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, St
         .map(|l| {
             l.parse::<age::x25519::Recipient>()
                 .map(|r| Box::new(r) as Box<dyn age::Recipient + Send>)
-                .map_err(|_| format!("invalid age recipient: {l}"))
+                .map_err(|_| "invalid age recipient in file".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
 
