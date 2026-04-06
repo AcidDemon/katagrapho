@@ -518,3 +518,72 @@ fn main() {
         process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_empty() {
+        assert!(validate("", 128, SAFE_ID_CHARS, "test").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_too_long() {
+        let long = "a".repeat(129);
+        assert!(validate(&long, 128, SAFE_ID_CHARS, "test").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_bad_chars() {
+        assert!(validate("hello/world", 128, SAFE_ID_CHARS, "test").is_err());
+        assert!(validate("hello world", 128, SAFE_ID_CHARS, "test").is_err());
+        assert!(validate("../evil", 128, SAFE_ID_CHARS, "test").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_good_ids() {
+        assert!(validate("abc123", 128, SAFE_ID_CHARS, "test").is_ok());
+        assert!(validate("session_id-001.test", 128, SAFE_ID_CHARS, "test").is_ok());
+    }
+
+    #[test]
+    fn validate_suffix_chars() {
+        assert!(validate("cast.age", 32, SAFE_SUFFIX_CHARS, "suffix").is_ok());
+        assert!(validate("cast/evil", 32, SAFE_SUFFIX_CHARS, "suffix").is_err());
+    }
+
+    #[test]
+    fn validate_directory_rejects_outside_storage() {
+        let result = validate_directory(Path::new("/tmp"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_directory_rejects_nonexistent() {
+        let result = validate_directory(Path::new("/nonexistent/path"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn termination_marker_format() {
+        let mut buf = Vec::new();
+        write_termination_marker(&mut buf, "test error");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("[999999.0"));
+        assert!(s.contains("test error"));
+        assert!(s.contains("\"x\""));
+        assert!(s.ends_with('\n'));
+    }
+
+    #[test]
+    fn sanitize_environment_removes_dangerous_vars() {
+        unsafe {
+            std::env::set_var("LD_PRELOAD", "/evil.so");
+            std::env::set_var("PATH", "/usr/bin");
+        }
+        sanitize_environment();
+        assert!(std::env::var("LD_PRELOAD").is_err());
+        assert!(std::env::var("PATH").is_ok());
+    }
+}
