@@ -48,13 +48,63 @@ fn sanitize_environment() {
 }
 
 /// Set a restrictive umask before any filesystem operations.
-/// Ensures directories created via mkdir(2) don't have a permissive
-/// window before explicit chmod.
 fn set_umask() {
-    // SAFETY: umask is a trivial syscall that cannot fail.
     unsafe {
         libc::umask(0o027);
     }
+}
+
+/// Close all inherited file descriptors >= 3.
+fn close_inherited_fds() {
+    // close_range(3, UINT_MAX, 0) — single syscall, Linux 5.9+.
+    let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) };
+    if ret == 0 {
+        return;
+    }
+    // Fallback: enumerate /proc/self/fd.
+    if let Ok(dir) = fs::read_dir("/proc/self/fd") {
+        let fds: Vec<i32> = dir
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|&fd| fd >= 3)
+            .collect();
+        for fd in fds {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Reset resource limits to prevent caller manipulation.
+fn reset_resource_limits() -> Result<(), String> {
+    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
+        return Err(format!("cannot reset RLIMIT_CORE: {}", io::Error::last_os_error()));
+    }
+
+    let fsize = libc::rlimit {
+        rlim_cur: MAX_FILE_SIZE + 1024 * 1024,
+        rlim_max: MAX_FILE_SIZE + 1024 * 1024,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &fsize) } != 0 {
+        return Err(format!("cannot reset RLIMIT_FSIZE: {}", io::Error::last_os_error()));
+    }
+
+    let nofile = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
+        return Err(format!("cannot reset RLIMIT_NOFILE: {}", io::Error::last_os_error()));
+    }
+
+    Ok(())
+}
+
+/// Harden process against debugging and privilege escalation.
+fn harden_process() -> Result<(), String> {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0_u64, 0_u64, 0_u64, 0_u64) } != 0 {
+        return Err(format!("PR_SET_DUMPABLE: {}", io::Error::last_os_error()));
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1_u64, 0_u64, 0_u64, 0_u64) } != 0 {
+        return Err(format!("PR_SET_NO_NEW_PRIVS: {}", io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +356,9 @@ fn install_signal_handlers() {
 fn run() -> Result<(), String> {
     sanitize_environment();
     set_umask();
+    close_inherited_fds();
+    reset_resource_limits()?;
+    harden_process()?;
     install_signal_handlers();
 
     let args = parse_args()?;
@@ -318,6 +371,20 @@ fn run() -> Result<(), String> {
     }
     if args.no_encrypt && args.recipient_file.is_some() {
         return Err("--no-encrypt and --recipient-file are mutually exclusive".to_string());
+    }
+
+    if let Some(ref rf) = args.recipient_file {
+        let rf_path = Path::new(rf);
+        let resolved = fs::canonicalize(rf_path)
+            .map_err(|e| format!("cannot resolve recipient file '{rf}': {e}"))?;
+        let allowed_dirs = ["/etc/katagrapho", "/etc/age", "/etc/epitropos"];
+        let in_allowed_dir = allowed_dirs.iter().any(|d| resolved.starts_with(d));
+        if !in_allowed_dir {
+            return Err(format!(
+                "recipient file must be in /etc/katagrapho/, /etc/age/, or /etc/epitropos/ (got '{}')",
+                resolved.display()
+            ));
+        }
     }
 
     let username = resolve_caller_username()?;
