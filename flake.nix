@@ -113,6 +113,13 @@
             pname = "katagrapho";
             version = "0.3.0";
           };
+
+          tests = craneLib.cargoTest {
+            inherit src;
+            pname = "katagrapho";
+            version = "0.3.0";
+            strictDeps = true;
+          };
         }
       );
 

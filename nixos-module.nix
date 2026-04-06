@@ -43,9 +43,10 @@ in
     storageDir = mkOption {
       type = types.path;
       default = "/var/log/ssh-sessions";
+      readOnly = true;
       description = ''
         Directory where session recordings are stored.
-        Must match the STORAGE_DIR constant in the binary.
+        Hardcoded in the binary — do not change.
       '';
     };
 
@@ -133,6 +134,8 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${pkgs.findutils}/bin/find -P ${cfg.storageDir} -maxdepth 2 -type f -not -type l -mtime +${toString cfg.logRotation.maxAgeDays} -delete";
+        User = cfg.user;
+        Group = cfg.group;
         ProtectSystem = "strict";
         ReadWritePaths = [ cfg.storageDir ];
         ProtectHome = true;

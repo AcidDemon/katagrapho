@@ -37,14 +37,38 @@ const SAFE_SUFFIX_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 // ---------------------------------------------------------------------------
 
 fn sanitize_environment() {
-    // Allowlist: nuke everything, keep only PATH.
-    let path = std::env::var("PATH").ok();
     for (key, _) in std::env::vars_os() {
         unsafe { std::env::remove_var(&key) };
     }
-    if let Some(p) = path {
-        unsafe { std::env::set_var("PATH", p) };
+}
+
+// ---------------------------------------------------------------------------
+// Syslog audit logging
+// ---------------------------------------------------------------------------
+
+const SYSLOG_IDENT: &[u8] = b"katagrapho\0";
+
+fn open_syslog() {
+    unsafe {
+        libc::openlog(
+            SYSLOG_IDENT.as_ptr() as *const libc::c_char,
+            libc::LOG_PID | libc::LOG_NDELAY,
+            libc::LOG_AUTH,
+        );
     }
+}
+
+fn close_syslog() {
+    unsafe { libc::closelog() };
+}
+
+fn syslog_msg(priority: libc::c_int, msg: &str) {
+    let fmt = CString::new("%s").unwrap();
+    let c_msg = match CString::new(msg) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    unsafe { libc::syslog(priority, fmt.as_ptr(), c_msg.as_ptr()) };
 }
 
 /// Set a restrictive umask before any filesystem operations.
@@ -129,6 +153,20 @@ fn resolve_caller_username() -> Result<String, String> {
         .map_err(|_| "username is not valid UTF-8".to_string())
 }
 
+/// Lock privilege transition: make euid/egid permanent and irrevocable.
+/// Must be called AFTER resolve_caller_username() since getuid() changes.
+fn lock_privileges() -> Result<(), String> {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    if unsafe { libc::setresgid(egid, egid, egid) } != 0 {
+        return Err(format!("setresgid: {}", io::Error::last_os_error()));
+    }
+    if unsafe { libc::setresuid(euid, euid, euid) } != 0 {
+        return Err(format!("setresuid: {}", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
@@ -197,7 +235,7 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, St
 
 /// Stream stdin to the given writer with a size limit.
 /// Returns the total number of bytes read from stdin.
-fn stream_stdin(writer: &mut dyn Write, _output_path: &Path) -> Result<u64, String> {
+fn stream_stdin(writer: &mut dyn Write) -> Result<u64, String> {
     let mut buf = [0u8; BUF_SIZE];
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -346,10 +384,17 @@ fn parse_args() -> Result<Args, String> {
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGTERM);
+        libc::sigaddset(&mut sa.sa_mask, libc::SIGINT);
         sa.sa_sigaction = handle_signal as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
+            process::abort();
+        }
+        if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
+            process::abort();
+        }
     }
 }
 
@@ -359,6 +404,7 @@ fn run() -> Result<(), String> {
     close_inherited_fds();
     reset_resource_limits()?;
     harden_process()?;
+    open_syslog();
     install_signal_handlers();
 
     let args = parse_args()?;
@@ -388,6 +434,12 @@ fn run() -> Result<(), String> {
     }
 
     let username = resolve_caller_username()?;
+    lock_privileges()?;
+
+    syslog_msg(
+        libc::LOG_INFO,
+        &format!("session start: user={username} session_id={}", args.session_id),
+    );
 
     validate(
         &args.session_id,
@@ -483,7 +535,10 @@ fn run() -> Result<(), String> {
         let mut encrypt_writer = encryptor
             .wrap_output(&mut file)
             .map_err(|e| format!("encryption init: {e}"))?;
-        let res = stream_stdin(&mut encrypt_writer, &output_path);
+        let res = stream_stdin(&mut encrypt_writer);
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            write_termination_marker(&mut encrypt_writer, "signal");
+        }
         if res.is_ok() {
             encrypt_writer
                 .finish()
@@ -491,22 +546,33 @@ fn run() -> Result<(), String> {
         }
         res
     } else {
-        stream_stdin(&mut file, &output_path)
+        stream_stdin(&mut file)
     };
 
     match result {
-        Ok(_) => {
+        Ok(bytes) => {
             file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+            syslog_msg(
+                libc::LOG_INFO,
+                &format!(
+                    "session end: user={username} session_id={} file={} bytes={bytes}",
+                    args.session_id,
+                    output_path.display(),
+                ),
+            );
+            close_syslog();
             Ok(())
         }
         Err(e) => {
-            // Best-effort: write termination marker to the file.
-            // For unencrypted files, write directly. For encrypted,
-            // the encryption stream may be in a bad state, so skip.
             if args.recipient_file.is_none() {
                 write_termination_marker(&mut file, &e);
             }
             let _ = file.sync_all();
+            syslog_msg(
+                libc::LOG_ERR,
+                &format!("session error: user={username} session_id={}: {e}", args.session_id),
+            );
+            close_syslog();
             Err(e)
         }
     }
@@ -515,6 +581,7 @@ fn run() -> Result<(), String> {
 fn main() {
     if let Err(msg) = run() {
         eprintln!("katagrapho: {msg}");
+        close_syslog();
         process::exit(1);
     }
 }
@@ -577,13 +644,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_environment_removes_dangerous_vars() {
+    fn sanitize_environment_removes_all_vars() {
         unsafe {
             std::env::set_var("LD_PRELOAD", "/evil.so");
             std::env::set_var("PATH", "/usr/bin");
         }
         sanitize_environment();
         assert!(std::env::var("LD_PRELOAD").is_err());
-        assert!(std::env::var("PATH").is_ok());
+        assert!(std::env::var("PATH").is_err());
     }
 }
