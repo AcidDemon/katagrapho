@@ -75,7 +75,7 @@ in
       };
 
       maxAgeDays = mkOption {
-        type = types.int;
+        type = types.ints.positive;
         default = 90;
         description = "Delete recordings older than this many days.";
       };
@@ -101,7 +101,11 @@ in
       }
     ];
 
-    users.groups.${cfg.group} = { };
+    users.groups.${cfg.group} = {
+      members = lib.optional
+        (config.services.epitropos.enable or false)
+        (config.services.epitropos.proxyUser or "session-proxy");
+    };
 
     users.users.${cfg.user} = {
       isSystemUser = true;
@@ -121,7 +125,7 @@ in
       group = cfg.group;
       setuid = true;
       setgid = true;
-      permissions = "u+rx,g+rx,o+rx";
+      permissions = "u+rx,g+rx,o-rwx";
     };
 
     systemd.services.katagrapho-cleanup = mkIf cfg.logRotation.enable {
@@ -139,6 +143,12 @@ in
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
         SystemCallArchitectures = "native";
+        PrivateNetwork = true;
+        PrivateDevices = true;
+        MemoryDenyWriteExecute = true;
+        RestrictNamespaces = true;
+        LockPersonality = true;
+        RestrictRealtime = true;
       };
     };
 
