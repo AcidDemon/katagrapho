@@ -746,6 +746,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_directory_rejects_symlink_outside_storage() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("evil");
+        symlink("/tmp", &link).unwrap();
+        let result = validate_directory(&link);
+        assert!(result.is_err(), "symlink to /tmp should be rejected");
+    }
+
+    #[test]
     fn sanitize_environment_removes_all_vars() {
         unsafe {
             std::env::set_var("LD_PRELOAD", "/evil.so");
