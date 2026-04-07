@@ -8,6 +8,13 @@ license = "MIT"
 [dependencies]
 libc = "0.2"
 age = { version = "0.11", default-features = false }
+thiserror = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"
+predicates = "3"
+age = { version = "0.11", default-features = false, features = ["armor"] }
 
 [profile.release]
 opt-level = "s"
