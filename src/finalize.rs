@@ -14,7 +14,9 @@ pub struct EncryptionFinalizer<W: Write> {
 
 impl<W: Write> EncryptionFinalizer<W> {
     pub fn new(writer: age::stream::StreamWriter<W>) -> Self {
-        Self { inner: Some(writer) }
+        Self {
+            inner: Some(writer),
+        }
     }
 
     /// Run finish() now and return its result. After this call, drop is a no-op.
@@ -65,10 +67,9 @@ mod tests {
         let recipient = identity.to_public();
         let mut buf: Vec<u8> = Vec::new();
         {
-            let encryptor = age::Encryptor::with_recipients(
-                std::iter::once(&recipient as &dyn age::Recipient),
-            )
-            .unwrap();
+            let encryptor =
+                age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                    .unwrap();
             let inner = encryptor.wrap_output(&mut buf).unwrap();
             let mut fin = EncryptionFinalizer::new(inner);
             fin.write_all(plaintext).unwrap();
@@ -110,10 +111,9 @@ mod tests {
         let recipient = identity.to_public();
         let mut buf: Vec<u8> = Vec::new();
         {
-            let encryptor = age::Encryptor::with_recipients(
-                std::iter::once(&recipient as &dyn age::Recipient),
-            )
-            .unwrap();
+            let encryptor =
+                age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                    .unwrap();
             let inner = encryptor.wrap_output(&mut buf).unwrap();
             let mut fin = EncryptionFinalizer::new(inner);
             fin.write_all(b"some session output\n").unwrap();

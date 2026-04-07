@@ -61,11 +61,26 @@ mod tests {
     #[test]
     fn exit_codes_are_distinct_per_class() {
         assert_eq!(KatagraphoError::Usage("x".into()).exit_code(), EX_USAGE);
-        assert_eq!(KatagraphoError::Validation("x".into()).exit_code(), EX_DATAERR);
-        assert_eq!(KatagraphoError::Recipient("x".into()).exit_code(), EX_NOINPUT);
-        assert_eq!(KatagraphoError::Privilege("x".into()).exit_code(), EX_NOPERM);
+        assert_eq!(
+            KatagraphoError::Validation("x".into()).exit_code(),
+            EX_DATAERR
+        );
+        assert_eq!(
+            KatagraphoError::Recipient("x".into()).exit_code(),
+            EX_NOINPUT
+        );
+        assert_eq!(
+            KatagraphoError::Privilege("x".into()).exit_code(),
+            EX_NOPERM
+        );
         assert_eq!(KatagraphoError::Storage("x".into()).exit_code(), EX_IOERR);
-        assert_eq!(KatagraphoError::Encryption("x".into()).exit_code(), EX_IOERR);
-        assert_eq!(KatagraphoError::Internal("x".into()).exit_code(), EX_SOFTWARE);
+        assert_eq!(
+            KatagraphoError::Encryption("x".into()).exit_code(),
+            EX_IOERR
+        );
+        assert_eq!(
+            KatagraphoError::Internal("x".into()).exit_code(),
+            EX_SOFTWARE
+        );
     }
 }

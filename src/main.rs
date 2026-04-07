@@ -106,7 +106,10 @@ fn close_inherited_fds() {
 
 /// Reset resource limits to prevent caller manipulation.
 fn reset_resource_limits() -> Result<(), KatagraphoError> {
-    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
         return Err(KatagraphoError::Privilege(format!(
             "cannot reset RLIMIT_CORE: {}",
@@ -125,7 +128,10 @@ fn reset_resource_limits() -> Result<(), KatagraphoError> {
         )));
     }
 
-    let nofile = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
+    let nofile = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: 64,
+    };
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
         return Err(KatagraphoError::Privilege(format!(
             "cannot reset RLIMIT_NOFILE: {}",
@@ -208,7 +214,9 @@ fn validate(
     label: &str,
 ) -> Result<(), KatagraphoError> {
     if input.is_empty() {
-        return Err(KatagraphoError::Validation(format!("{label} cannot be empty")));
+        return Err(KatagraphoError::Validation(format!(
+            "{label} cannot be empty"
+        )));
     }
     if input.len() > max_len {
         return Err(KatagraphoError::Validation(format!(
@@ -256,9 +264,7 @@ fn validate_directory(path: &Path) -> Result<(), KatagraphoError> {
 
 /// Load age recipients (public keys) from a file.
 /// Each line is either an age public key or a comment (starting with #).
-fn load_recipients(
-    path: &str,
-) -> Result<Vec<Box<dyn age::Recipient + Send>>, KatagraphoError> {
+fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, KatagraphoError> {
     let contents = fs::read_to_string(path).map_err(|e| {
         KatagraphoError::Recipient(format!("cannot read recipient file '{path}': {e}"))
     })?;
@@ -402,7 +408,10 @@ fn parse_args() -> Result<Args, KatagraphoError> {
             }
             // Known flags without a following value.
             "--session-id" | "--suffix" | "--recipient-file" => {
-                return Err(KatagraphoError::Usage(format!("{} requires a value", args[i])));
+                return Err(KatagraphoError::Usage(format!(
+                    "{} requires a value",
+                    args[i]
+                )));
             }
             "--help" | "-h" => {
                 eprintln!(
@@ -509,7 +518,10 @@ fn run() -> Result<(), KatagraphoError> {
 
     syslog_msg(
         libc::LOG_INFO,
-        &format!("session start: user={username} session_id={}", args.session_id),
+        &format!(
+            "session start: user={username} session_id={}",
+            args.session_id
+        ),
     );
 
     validate(
@@ -552,12 +564,11 @@ fn run() -> Result<(), KatagraphoError> {
     // Open the user directory with O_DIRECTORY | O_NOFOLLOW to get a
     // race-free file descriptor. This prevents TOCTOU attacks where the
     // directory is replaced with a symlink between validation and file open.
-    let dir_cstr = CString::new(
-        user_dir
-            .to_str()
-            .ok_or_else(|| KatagraphoError::Storage("user directory path not UTF-8".to_string()))?,
-    )
-    .map_err(|_| KatagraphoError::Storage("directory path contains null byte".to_string()))?;
+    let dir_cstr =
+        CString::new(user_dir.to_str().ok_or_else(|| {
+            KatagraphoError::Storage("user directory path not UTF-8".to_string())
+        })?)
+        .map_err(|_| KatagraphoError::Storage("directory path contains null byte".to_string()))?;
 
     let dir_fd = unsafe {
         libc::open(
