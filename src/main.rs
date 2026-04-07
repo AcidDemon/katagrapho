@@ -8,6 +8,7 @@
 // with mode 0440 — the recorded user cannot modify or delete them.
 
 mod error;
+mod finalize;
 
 use crate::error::KatagraphoError;
 use std::ffi::{CStr, CString};
