@@ -35,6 +35,7 @@ pub enum KatagraphoError {
     Io(#[from] io::Error),
 
     #[error("internal: {0}")]
+    #[allow(dead_code)]
     Internal(String),
 }
 

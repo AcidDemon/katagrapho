@@ -101,10 +101,13 @@ fn close_inherited_fds() {
 }
 
 /// Reset resource limits to prevent caller manipulation.
-fn reset_resource_limits() -> Result<(), String> {
+fn reset_resource_limits() -> Result<(), KatagraphoError> {
     let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
-        return Err(format!("cannot reset RLIMIT_CORE: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "cannot reset RLIMIT_CORE: {}",
+            io::Error::last_os_error()
+        )));
     }
 
     let fsize = libc::rlimit {
@@ -112,24 +115,36 @@ fn reset_resource_limits() -> Result<(), String> {
         rlim_max: MAX_FILE_SIZE + 1024 * 1024,
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &fsize) } != 0 {
-        return Err(format!("cannot reset RLIMIT_FSIZE: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "cannot reset RLIMIT_FSIZE: {}",
+            io::Error::last_os_error()
+        )));
     }
 
     let nofile = libc::rlimit { rlim_cur: 64, rlim_max: 64 };
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
-        return Err(format!("cannot reset RLIMIT_NOFILE: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "cannot reset RLIMIT_NOFILE: {}",
+            io::Error::last_os_error()
+        )));
     }
 
     Ok(())
 }
 
 /// Harden process against debugging and privilege escalation.
-fn harden_process() -> Result<(), String> {
+fn harden_process() -> Result<(), KatagraphoError> {
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0_u64, 0_u64, 0_u64, 0_u64) } != 0 {
-        return Err(format!("PR_SET_DUMPABLE: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "PR_SET_DUMPABLE: {}",
+            io::Error::last_os_error()
+        )));
     }
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1_u64, 0_u64, 0_u64, 0_u64) } != 0 {
-        return Err(format!("PR_SET_NO_NEW_PRIVS: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "PR_SET_NO_NEW_PRIVS: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
 }
@@ -141,31 +156,39 @@ fn harden_process() -> Result<(), String> {
 /// Resolve the real username of the calling process via getuid()/getpwuid().
 /// This is immune to caller spoofing — unlike a --user flag, the kernel
 /// provides the real UID.
-fn resolve_caller_username() -> Result<String, String> {
+fn resolve_caller_username() -> Result<String, KatagraphoError> {
     // SAFETY: getuid() is always safe and cannot fail.
     let uid = unsafe { libc::getuid() };
     // SAFETY: getpwuid returns a pointer to a static buffer (or null).
     let pw = unsafe { libc::getpwuid(uid) };
     if pw.is_null() {
-        return Err(format!("cannot resolve username for uid {uid}"));
+        return Err(KatagraphoError::Privilege(format!(
+            "cannot resolve username for uid {uid}"
+        )));
     }
     // SAFETY: pw_name is a valid C string when pw is non-null.
     let name = unsafe { CStr::from_ptr((*pw).pw_name) };
     name.to_str()
         .map(|s| s.to_string())
-        .map_err(|_| "username is not valid UTF-8".to_string())
+        .map_err(|_| KatagraphoError::Privilege("username is not valid UTF-8".to_string()))
 }
 
 /// Lock privilege transition: make euid/egid permanent and irrevocable.
 /// Must be called AFTER resolve_caller_username() since getuid() changes.
-fn lock_privileges() -> Result<(), String> {
+fn lock_privileges() -> Result<(), KatagraphoError> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     if unsafe { libc::setresgid(egid, egid, egid) } != 0 {
-        return Err(format!("setresgid: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "setresgid: {}",
+            io::Error::last_os_error()
+        )));
     }
     if unsafe { libc::setresuid(euid, euid, euid) } != 0 {
-        return Err(format!("setresuid: {}", io::Error::last_os_error()));
+        return Err(KatagraphoError::Privilege(format!(
+            "setresuid: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(())
 }
@@ -174,35 +197,51 @@ fn lock_privileges() -> Result<(), String> {
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-fn validate(input: &str, max_len: usize, allowed: &str, label: &str) -> Result<(), String> {
+fn validate(
+    input: &str,
+    max_len: usize,
+    allowed: &str,
+    label: &str,
+) -> Result<(), KatagraphoError> {
     if input.is_empty() {
-        return Err(format!("{label} cannot be empty"));
+        return Err(KatagraphoError::Validation(format!("{label} cannot be empty")));
     }
     if input.len() > max_len {
-        return Err(format!("{label} too long (max {max_len})"));
+        return Err(KatagraphoError::Validation(format!(
+            "{label} too long (max {max_len})"
+        )));
     }
     if let Some(ch) = input.chars().find(|c| !allowed.contains(*c)) {
-        return Err(format!("{label} contains invalid character: '{ch}'"));
+        return Err(KatagraphoError::Validation(format!(
+            "{label} contains invalid character: '{ch}'"
+        )));
     }
     Ok(())
 }
 
 /// Validate that a path resolves to a real directory inside STORAGE_DIR.
-fn validate_directory(path: &Path) -> Result<(), String> {
-    let resolved =
-        fs::canonicalize(path).map_err(|e| format!("cannot resolve '{}': {e}", path.display()))?;
+fn validate_directory(path: &Path) -> Result<(), KatagraphoError> {
+    let resolved = fs::canonicalize(path).map_err(|e| {
+        KatagraphoError::Storage(format!("cannot resolve '{}': {e}", path.display()))
+    })?;
 
     // Path::starts_with checks component boundaries, so
     // "/var/log/ssh-sessions-evil" will NOT match "/var/log/ssh-sessions".
     if !resolved.starts_with(STORAGE_DIR) {
-        return Err("path resolves outside storage directory".to_string());
+        return Err(KatagraphoError::Storage(
+            "path resolves outside storage directory".to_string(),
+        ));
     }
 
     // canonicalize() already resolved all symlinks, so the resolved path
     // itself cannot be a symlink. We only need to confirm it is a directory.
-    let meta = fs::symlink_metadata(&resolved).map_err(|e| format!("cannot stat: {e}"))?;
+    let meta = fs::symlink_metadata(&resolved)
+        .map_err(|e| KatagraphoError::Storage(format!("cannot stat: {e}")))?;
     if !meta.is_dir() {
-        return Err(format!("'{}' is not a directory", path.display()));
+        return Err(KatagraphoError::Storage(format!(
+            "'{}' is not a directory",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -213,9 +252,12 @@ fn validate_directory(path: &Path) -> Result<(), String> {
 
 /// Load age recipients (public keys) from a file.
 /// Each line is either an age public key or a comment (starting with #).
-fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, String> {
-    let contents = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read recipient file '{path}': {e}"))?;
+fn load_recipients(
+    path: &str,
+) -> Result<Vec<Box<dyn age::Recipient + Send>>, KatagraphoError> {
+    let contents = fs::read_to_string(path).map_err(|e| {
+        KatagraphoError::Recipient(format!("cannot read recipient file '{path}': {e}"))
+    })?;
 
     let recipients: Vec<Box<dyn age::Recipient + Send>> = contents
         .lines()
@@ -226,19 +268,23 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, St
         .map(|l| {
             l.parse::<age::x25519::Recipient>()
                 .map(|r| Box::new(r) as Box<dyn age::Recipient + Send>)
-                .map_err(|_| "invalid age recipient in file".to_string())
+                .map_err(|_| {
+                    KatagraphoError::Recipient("invalid age recipient in file".to_string())
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     if recipients.is_empty() {
-        return Err(format!("no recipients found in '{path}'"));
+        return Err(KatagraphoError::Recipient(format!(
+            "no recipients found in '{path}'"
+        )));
     }
     Ok(recipients)
 }
 
 /// Stream stdin to the given writer with a size limit.
 /// Returns the total number of bytes read from stdin.
-fn stream_stdin(writer: &mut dyn Write) -> Result<u64, String> {
+fn stream_stdin(writer: &mut dyn Write) -> Result<u64, KatagraphoError> {
     let mut buf = [0u8; BUF_SIZE];
     let stdin = io::stdin();
     let mut reader = stdin.lock();
@@ -253,19 +299,19 @@ fn stream_stdin(writer: &mut dyn Write) -> Result<u64, String> {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                return Err(format!("read: {e}"));
+                return Err(KatagraphoError::Io(e));
             }
         };
 
         total_read += n as u64;
         if total_read > MAX_FILE_SIZE {
-            return Err(format!(
+            return Err(KatagraphoError::Storage(format!(
                 "session exceeds maximum size ({MAX_FILE_SIZE} bytes)"
-            ));
+            )));
         }
 
         if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(format!("write: {e}"));
+            return Err(KatagraphoError::Io(e));
         }
     }
 
@@ -285,7 +331,7 @@ fn write_termination_marker(writer: &mut dyn Write, reason: &str) {
 // Directory management
 // ---------------------------------------------------------------------------
 
-fn ensure_user_dir(username: &str) -> Result<PathBuf, String> {
+fn ensure_user_dir(username: &str) -> Result<PathBuf, KatagraphoError> {
     let dir = PathBuf::from(format!("{STORAGE_DIR}/{username}"));
 
     // Use DirBuilder to pass the mode directly to mkdir(2).
@@ -299,7 +345,10 @@ fn ensure_user_dir(username: &str) -> Result<PathBuf, String> {
             validate_directory(&dir)?;
             Ok(dir)
         }
-        Err(e) => Err(format!("mkdir '{}': {e}", dir.display())),
+        Err(e) => Err(KatagraphoError::Storage(format!(
+            "mkdir '{}': {e}",
+            dir.display()
+        ))),
     }
 }
 
@@ -314,7 +363,7 @@ struct Args {
     no_encrypt: bool,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> Result<Args, KatagraphoError> {
     let args: Vec<String> = std::env::args().collect();
     let mut session_id = None;
     let mut suffix: Option<String> = None;
@@ -341,7 +390,7 @@ fn parse_args() -> Result<Args, String> {
             }
             // Known flags without a following value.
             "--session-id" | "--suffix" | "--recipient-file" => {
-                return Err(format!("{} requires a value", args[i]));
+                return Err(KatagraphoError::Usage(format!("{} requires a value", args[i])));
             }
             "--help" | "-h" => {
                 eprintln!(
@@ -361,7 +410,9 @@ fn parse_args() -> Result<Args, String> {
                 );
                 process::exit(0);
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => {
+                return Err(KatagraphoError::Usage(format!("unknown argument: {other}")));
+            }
         }
         i += 1;
     }
@@ -373,7 +424,8 @@ fn parse_args() -> Result<Args, String> {
     };
 
     Ok(Args {
-        session_id: session_id.ok_or("--session-id required")?,
+        session_id: session_id
+            .ok_or_else(|| KatagraphoError::Usage("--session-id required".to_string()))?,
         suffix: suffix.unwrap_or(default_suffix),
         recipient_file,
         no_encrypt,
@@ -401,7 +453,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), KatagraphoError> {
     sanitize_environment();
     set_umask();
     close_inherited_fds();
@@ -413,26 +465,29 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
 
     if !args.no_encrypt && args.recipient_file.is_none() {
-        return Err(
+        return Err(KatagraphoError::Usage(
             "--recipient-file is required (use --no-encrypt to explicitly disable encryption)"
                 .to_string(),
-        );
+        ));
     }
     if args.no_encrypt && args.recipient_file.is_some() {
-        return Err("--no-encrypt and --recipient-file are mutually exclusive".to_string());
+        return Err(KatagraphoError::Usage(
+            "--no-encrypt and --recipient-file are mutually exclusive".to_string(),
+        ));
     }
 
     if let Some(ref rf) = args.recipient_file {
         let rf_path = Path::new(rf);
-        let resolved = fs::canonicalize(rf_path)
-            .map_err(|e| format!("cannot resolve recipient file '{rf}': {e}"))?;
+        let resolved = fs::canonicalize(rf_path).map_err(|e| {
+            KatagraphoError::Recipient(format!("cannot resolve recipient file '{rf}': {e}"))
+        })?;
         let allowed_dirs = ["/etc/katagrapho", "/etc/age", "/etc/epitropos"];
         let in_allowed_dir = allowed_dirs.iter().any(|d| resolved.starts_with(d));
         if !in_allowed_dir {
-            return Err(format!(
+            return Err(KatagraphoError::Recipient(format!(
                 "recipient file must be in /etc/katagrapho/, /etc/age/, or /etc/epitropos/ (got '{}')",
                 resolved.display()
-            ));
+            )));
         }
     }
 
@@ -453,10 +508,14 @@ fn run() -> Result<(), String> {
     validate(&username, MAX_USERNAME, SAFE_ID_CHARS, "username")?;
 
     if !args.suffix.starts_with('.') {
-        return Err("suffix must start with '.'".to_string());
+        return Err(KatagraphoError::Validation(
+            "suffix must start with '.'".to_string(),
+        ));
     }
     if args.suffix.starts_with("..") {
-        return Err("suffix cannot start with '..'".to_string());
+        return Err(KatagraphoError::Validation(
+            "suffix cannot start with '..'".to_string(),
+        ));
     }
     validate(
         &args.suffix[1..],
@@ -472,14 +531,20 @@ fn run() -> Result<(), String> {
     // Verify the assembled path stays within STORAGE_DIR.
     // Path::starts_with checks component boundaries correctly.
     if !output_path.starts_with(STORAGE_DIR) {
-        return Err("path escapes storage directory".to_string());
+        return Err(KatagraphoError::Storage(
+            "path escapes storage directory".to_string(),
+        ));
     }
 
     // Open the user directory with O_DIRECTORY | O_NOFOLLOW to get a
     // race-free file descriptor. This prevents TOCTOU attacks where the
     // directory is replaced with a symlink between validation and file open.
-    let dir_cstr = CString::new(user_dir.to_str().ok_or("user directory path not UTF-8")?)
-        .map_err(|_| "directory path contains null byte")?;
+    let dir_cstr = CString::new(
+        user_dir
+            .to_str()
+            .ok_or_else(|| KatagraphoError::Storage("user directory path not UTF-8".to_string()))?,
+    )
+    .map_err(|_| KatagraphoError::Storage("directory path contains null byte".to_string()))?;
 
     let dir_fd = unsafe {
         libc::open(
@@ -488,19 +553,19 @@ fn run() -> Result<(), String> {
         )
     };
     if dir_fd < 0 {
-        return Err(format!(
+        return Err(KatagraphoError::Storage(format!(
             "open directory '{}': {}",
             user_dir.display(),
             io::Error::last_os_error()
-        ));
+        )));
     }
 
     // Use openat() relative to the directory fd to create the file.
     // O_CREAT|O_EXCL: atomic create, fail if exists.
     // O_NOFOLLOW: refuse to follow symlinks in the filename.
     // Mode 0440: read-only for owner (session-writer) + group (ssh-sessions).
-    let filename_cstr =
-        CString::new(filename.as_str()).map_err(|_| "filename contains null byte")?;
+    let filename_cstr = CString::new(filename.as_str())
+        .map_err(|_| KatagraphoError::Storage("filename contains null byte".to_string()))?;
 
     let file_fd = unsafe {
         libc::openat(
@@ -517,27 +582,28 @@ fn run() -> Result<(), String> {
     }
 
     if file_fd < 0 {
-        return Err(format!(
+        return Err(KatagraphoError::Storage(format!(
             "open '{}': {}",
             output_path.display(),
             io::Error::last_os_error()
-        ));
+        )));
     }
 
     // SAFETY: file_fd is a valid, exclusively-owned file descriptor.
     let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
 
-    let result = if let Some(ref recipient_path) = args.recipient_file {
+    let result: Result<u64, KatagraphoError> = if let Some(ref recipient_path) = args.recipient_file
+    {
         let recipients = load_recipients(recipient_path)?;
         let recipients_ref: Vec<&dyn age::Recipient> = recipients
             .iter()
             .map(|r| r.as_ref() as &dyn age::Recipient)
             .collect();
         let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
-            .map_err(|e| format!("encryption setup: {e}"))?;
+            .map_err(|e| KatagraphoError::Encryption(format!("setup: {e}")))?;
         let mut encrypt_writer = encryptor
             .wrap_output(&mut file)
-            .map_err(|e| format!("encryption init: {e}"))?;
+            .map_err(|e| KatagraphoError::Encryption(format!("init: {e}")))?;
         let res = stream_stdin(&mut encrypt_writer);
         if SHUTDOWN.load(Ordering::SeqCst) {
             write_termination_marker(&mut encrypt_writer, "signal");
@@ -545,7 +611,7 @@ fn run() -> Result<(), String> {
         if res.is_ok() {
             encrypt_writer
                 .finish()
-                .map_err(|e| format!("encryption finalize: {e}"))?;
+                .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
         }
         res
     } else {
@@ -554,7 +620,7 @@ fn run() -> Result<(), String> {
 
     match result {
         Ok(bytes) => {
-            file.sync_all().map_err(|e| format!("fsync: {e}"))?;
+            file.sync_all().map_err(KatagraphoError::Io)?;
             syslog_msg(
                 libc::LOG_INFO,
                 &format!(
@@ -568,12 +634,15 @@ fn run() -> Result<(), String> {
         }
         Err(e) => {
             if args.recipient_file.is_none() {
-                write_termination_marker(&mut file, &e);
+                write_termination_marker(&mut file, &format!("{e}"));
             }
             let _ = file.sync_all();
             syslog_msg(
                 libc::LOG_ERR,
-                &format!("session error: user={username} session_id={}: {e}", args.session_id),
+                &format!(
+                    "session error: user={username} session_id={}: {e}",
+                    args.session_id
+                ),
             );
             close_syslog();
             Err(e)
@@ -582,10 +651,13 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
-    if let Err(msg) = run() {
-        eprintln!("katagrapho: {msg}");
-        close_syslog();
-        process::exit(1);
+    match run() {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("katagrapho: {e}");
+            close_syslog();
+            process::exit(e.exit_code());
+        }
     }
 }
 
