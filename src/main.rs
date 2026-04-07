@@ -26,7 +26,10 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
 
-const STORAGE_DIR: &str = "/var/log/ssh-sessions";
+const STORAGE_DIR: &str = match option_env!("KATAGRAPHO_STORAGE_DIR") {
+    Some(p) => p,
+    None => "/var/log/ssh-sessions",
+};
 const BUF_SIZE: usize = 65536;
 const MAX_SESSION_ID: usize = 128;
 const MAX_USERNAME: usize = 64;
