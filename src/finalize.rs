@@ -98,4 +98,37 @@ mod tests {
         let pt = b"hello via drop";
         assert_eq!(round_trip(pt, false), pt);
     }
+
+    /// Regression test for the SIGTERM-mid-stream finalize bug.
+    /// Simulates: stream some data, write a termination marker, then
+    /// drop without calling finish() — the previous code path that
+    /// only called finish() on Ok would lose the marker AND leave the
+    /// blob undecryptable. Drop must finalize.
+    #[test]
+    fn termination_marker_before_drop_survives() {
+        let identity = Identity::generate();
+        let recipient = identity.to_public();
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let encryptor = age::Encryptor::with_recipients(
+                std::iter::once(&recipient as &dyn age::Recipient),
+            )
+            .unwrap();
+            let inner = encryptor.wrap_output(&mut buf).unwrap();
+            let mut fin = EncryptionFinalizer::new(inner);
+            fin.write_all(b"some session output\n").unwrap();
+            // Termination marker (the bug-trigger pattern):
+            fin.write_all(b"[999999.0, \"x\", \"signal\"]\n").unwrap();
+            // Drop without finish() — Drop must still finalize.
+        }
+        let decryptor = age::Decryptor::new(Cursor::new(buf)).unwrap();
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .expect("must decrypt — finalize-on-drop bug regressed");
+        let mut out = String::new();
+        reader.read_to_string(&mut out).unwrap();
+        assert!(out.contains("some session output"));
+        assert!(out.contains("\"x\""), "marker missing");
+        assert!(out.contains("signal"), "reason missing");
+    }
 }
