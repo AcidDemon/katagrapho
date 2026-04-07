@@ -7,6 +7,9 @@
 // "ssh-sessions". Files are therefore owned by session-writer:ssh-sessions
 // with mode 0440 — the recorded user cannot modify or delete them.
 
+mod error;
+
+use crate::error::KatagraphoError;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Read, Write};
