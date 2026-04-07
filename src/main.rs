@@ -377,6 +377,14 @@ fn parse_args() -> Result<Args, KatagraphoError> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--version" | "-V" => {
+                println!(
+                    "katagrapho {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("KATAGRAPHO_GIT_COMMIT")
+                );
+                process::exit(0);
+            }
             "--session-id" if i + 1 < args.len() => {
                 i += 1;
                 session_id = Some(args[i].clone());
@@ -412,6 +420,7 @@ fn parse_args() -> Result<Args, KatagraphoError> {
                 eprintln!(
                     "  --suffix <SUFFIX>         Override output file suffix (default: .cast.age or .cast with --no-encrypt)"
                 );
+                eprintln!("  --version, -V             Print version and git commit");
                 process::exit(0);
             }
             other => {
