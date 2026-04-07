@@ -17,9 +17,19 @@ impl<W: Write> EncryptionFinalizer<W> {
         Self { inner: Some(writer) }
     }
 
-    pub fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+    /// Run finish() now and return its result. After this call, drop is a no-op.
+    pub fn finish(mut self) -> io::Result<()> {
+        match self.inner.take() {
+            Some(w) => w.finish().map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<W: Write> Write for EncryptionFinalizer<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.inner.as_mut() {
-            Some(w) => w.write_all(buf),
+            Some(w) => w.write(buf),
             None => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "finalizer drained",
@@ -27,10 +37,9 @@ impl<W: Write> EncryptionFinalizer<W> {
         }
     }
 
-    /// Run finish() now and return its result. After this call, drop is a no-op.
-    pub fn finish(mut self) -> io::Result<()> {
-        match self.inner.take() {
-            Some(w) => w.finish().map(|_| ()),
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner.as_mut() {
+            Some(w) => w.flush(),
             None => Ok(()),
         }
     }

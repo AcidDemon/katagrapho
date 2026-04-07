@@ -595,6 +595,7 @@ fn run() -> Result<(), KatagraphoError> {
 
     let result: Result<u64, KatagraphoError> = if let Some(ref recipient_path) = args.recipient_file
     {
+        use crate::finalize::EncryptionFinalizer;
         let recipients = load_recipients(recipient_path)?;
         let recipients_ref: Vec<&dyn age::Recipient> = recipients
             .iter()
@@ -602,21 +603,35 @@ fn run() -> Result<(), KatagraphoError> {
             .collect();
         let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
             .map_err(|e| KatagraphoError::Encryption(format!("setup: {e}")))?;
-        let mut encrypt_writer = encryptor
+        let inner = encryptor
             .wrap_output(&mut file)
             .map_err(|e| KatagraphoError::Encryption(format!("init: {e}")))?;
-        let res = stream_stdin(&mut encrypt_writer);
+        let mut fin = EncryptionFinalizer::new(inner);
+
+        let res = stream_stdin(&mut fin);
+
+        // Always write termination marker if we were signalled or if the
+        // stream errored — BEFORE finish(), so it lives inside the encrypted blob.
         if SHUTDOWN.load(Ordering::SeqCst) {
-            write_termination_marker(&mut encrypt_writer, "signal");
+            write_termination_marker(&mut fin, "signal");
+        } else if let Err(ref e) = res {
+            write_termination_marker(&mut fin, &format!("{e}"));
         }
-        if res.is_ok() {
-            encrypt_writer
-                .finish()
-                .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
-        }
+
+        // ALWAYS finalize, regardless of res. If finalize itself fails,
+        // surface that as an Encryption error overriding any prior error.
+        fin.finish()
+            .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
+
         res
     } else {
-        stream_stdin(&mut file)
+        let res = stream_stdin(&mut file);
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            write_termination_marker(&mut file, "signal");
+        } else if let Err(ref e) = res {
+            write_termination_marker(&mut file, &format!("{e}"));
+        }
+        res
     };
 
     match result {
@@ -634,9 +649,8 @@ fn run() -> Result<(), KatagraphoError> {
             Ok(())
         }
         Err(e) => {
-            if args.recipient_file.is_none() {
-                write_termination_marker(&mut file, &format!("{e}"));
-            }
+            // Termination marker (if any) was already written into the
+            // file/encryption stream above, before this match.
             let _ = file.sync_all();
             syslog_msg(
                 libc::LOG_ERR,
