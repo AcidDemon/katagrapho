@@ -13,6 +13,7 @@ mod finalize;
 mod kata_config;
 mod manifest;
 mod signing;
+mod stream;
 
 use crate::error::KatagraphoError;
 use std::ffi::{CStr, CString};
