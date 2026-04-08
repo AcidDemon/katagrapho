@@ -7,6 +7,7 @@
 // "ssh-sessions". Files are therefore owned by session-writer:ssh-sessions
 // with mode 0440 — the recorded user cannot modify or delete them.
 
+mod chain;
 mod error;
 mod finalize;
 mod manifest;
