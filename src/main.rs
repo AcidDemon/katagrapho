@@ -14,6 +14,7 @@ mod kata_config;
 mod manifest;
 mod signing;
 mod stream;
+mod verify;
 
 use crate::error::KatagraphoError;
 use std::ffi::{CStr, CString};
