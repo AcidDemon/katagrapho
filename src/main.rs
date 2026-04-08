@@ -36,7 +36,6 @@ const STORAGE_DIR: &str = match option_env!("KATAGRAPHO_STORAGE_DIR") {
     Some(p) => p,
     None => "/var/log/ssh-sessions",
 };
-const BUF_SIZE: usize = 65536;
 const MAX_SESSION_ID: usize = 128;
 const MAX_USERNAME: usize = 64;
 const MAX_SUFFIX: usize = 32;
@@ -296,51 +295,6 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, Ka
         )));
     }
     Ok(recipients)
-}
-
-/// Stream stdin to the given writer with a size limit.
-/// Returns the total number of bytes read from stdin.
-fn stream_stdin(writer: &mut dyn Write) -> Result<u64, KatagraphoError> {
-    let mut buf = [0u8; BUF_SIZE];
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut total_read: u64 = 0;
-
-    loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            break;
-        }
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                return Err(KatagraphoError::Io(e));
-            }
-        };
-
-        total_read += n as u64;
-        if total_read > MAX_FILE_SIZE {
-            return Err(KatagraphoError::Storage(format!(
-                "session exceeds maximum size ({MAX_FILE_SIZE} bytes)"
-            )));
-        }
-
-        if let Err(e) = writer.write_all(&buf[..n]) {
-            return Err(KatagraphoError::Io(e));
-        }
-    }
-
-    Ok(total_read)
-}
-
-/// Attempt to write a termination marker to the recording.
-/// This is best-effort — if writing fails, we still want to preserve
-/// whatever partial data we have.
-fn write_termination_marker(writer: &mut dyn Write, reason: &str) {
-    // Use a fixed large elapsed time to ensure it sorts last.
-    let marker = format!("[999999.0, \"x\", {:?}]\n", reason);
-    let _ = writer.write_all(marker.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +578,8 @@ fn run() -> Result<(), KatagraphoError> {
 
     // Load signing key + chain paths from config (defaults apply if no --config).
     let kata_cfg = crate::kata_config::KataConfig::default();
-    let signing_key = crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
+    let signing_key =
+        crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
     let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
 
     // Process the kgv1 stream: forward raw bytes into the encrypted file,
@@ -744,9 +699,7 @@ fn process_v1_stream(
             match event {
                 Event::Header(h) => {
                     if header_info.is_some() {
-                        return Err(KatagraphoError::Stream(
-                            "second header record".to_string(),
-                        ));
+                        return Err(KatagraphoError::Stream("second header record".to_string()));
                     }
                     header_info = Some(h);
                 }
@@ -759,7 +712,11 @@ fn process_v1_stream(
                         sha256: c.sha256_hex,
                     });
                 }
-                Event::End { reason, exit_code: ec, .. } => {
+                Event::End {
+                    reason,
+                    exit_code: ec,
+                    ..
+                } => {
                     end_reason = reason;
                     exit_code = ec;
                     break;
@@ -781,9 +738,7 @@ fn process_v1_stream(
             match event {
                 Event::Header(h) => {
                     if header_info.is_some() {
-                        return Err(KatagraphoError::Stream(
-                            "second header record".to_string(),
-                        ));
+                        return Err(KatagraphoError::Stream("second header record".to_string()));
                     }
                     header_info = Some(h);
                 }
@@ -796,7 +751,11 @@ fn process_v1_stream(
                         sha256: c.sha256_hex,
                     });
                 }
-                Event::End { reason, exit_code: ec, .. } => {
+                Event::End {
+                    reason,
+                    exit_code: ec,
+                    ..
+                } => {
                     end_reason = reason;
                     exit_code = ec;
                     break;
@@ -992,17 +951,6 @@ mod tests {
     fn validate_directory_rejects_nonexistent() {
         let result = validate_directory(Path::new("/nonexistent/path"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn termination_marker_format() {
-        let mut buf = Vec::new();
-        write_termination_marker(&mut buf, "test error");
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("[999999.0"));
-        assert!(s.contains("test error"));
-        assert!(s.contains("\"x\""));
-        assert!(s.ends_with('\n'));
     }
 
     #[test]

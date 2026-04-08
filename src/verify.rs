@@ -1,5 +1,7 @@
 //! High-level verification orchestration for the katagrapho-verify tool.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -112,7 +114,8 @@ mod tests {
     #[test]
     fn verify_recursive_walks_chain_clean() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
 
         let mut m1 = make(GENESIS_PREV, "s1");
         m1.sign(&kp).unwrap();
@@ -130,7 +133,8 @@ mod tests {
     #[test]
     fn verify_recursive_detects_broken_chain() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
 
         let mut m1 = make(GENESIS_PREV, "s1");
         m1.sign(&kp).unwrap();
@@ -146,7 +150,8 @@ mod tests {
     #[test]
     fn verify_single_detects_tampered_field() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
         let mut m = make(GENESIS_PREV, "s1");
         m.sign(&kp).unwrap();
         let path = dir.path().join("s1.manifest.json");

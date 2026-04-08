@@ -12,7 +12,7 @@ const DEFAULT_KEY_PATH: &str = "/var/lib/katagrapho/signing.key";
 const DEFAULT_PUB_PATH: &str = "/var/lib/katagrapho/signing.pub";
 const DEFAULT_CHAIN_DIR: &str = "/var/lib/katagrapho";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct KataConfig {
@@ -98,16 +98,6 @@ impl Default for Chain {
     fn default() -> Self {
         Self {
             dir: PathBuf::from(DEFAULT_CHAIN_DIR),
-        }
-    }
-}
-
-impl Default for KataConfig {
-    fn default() -> Self {
-        Self {
-            storage: Storage::default(),
-            signing: Signing::default(),
-            chain: Chain::default(),
         }
     }
 }

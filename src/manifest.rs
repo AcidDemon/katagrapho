@@ -122,7 +122,9 @@ impl Manifest {
         let sig_bytes = base64_decode(&self.signature)
             .map_err(|e| KatagraphoError::Verify(format!("base64 decode sig: {e}")))?;
         if sig_bytes.len() != 64 {
-            return Err(KatagraphoError::Verify("signature wrong length".to_string()));
+            return Err(KatagraphoError::Verify(
+                "signature wrong length".to_string(),
+            ));
         }
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&sig_bytes);
@@ -146,8 +148,7 @@ impl Manifest {
         f.sync_all()
             .map_err(|e| KatagraphoError::Manifest(format!("fsync: {e}")))?;
         drop(f);
-        fs::rename(&tmp, path)
-            .map_err(|e| KatagraphoError::Manifest(format!("rename: {e}")))?;
+        fs::rename(&tmp, path).map_err(|e| KatagraphoError::Manifest(format!("rename: {e}")))?;
         Ok(())
     }
 
@@ -197,7 +198,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
     }
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err("base64 length not multiple of 4".to_string());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -286,7 +287,8 @@ mod tests {
     #[test]
     fn sign_then_verify_succeeds() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
         let mut m = sample();
         m.sign(&kp).unwrap();
         m.verify(&kp.public_bytes()).unwrap();
@@ -295,7 +297,8 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_field() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
         let mut m = sample();
         m.sign(&kp).unwrap();
         m.user = "mallory".to_string();
@@ -305,7 +308,8 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_signature() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
         let mut m = sample();
         m.sign(&kp).unwrap();
         let mut chars: Vec<char> = m.signature.chars().collect();
@@ -317,7 +321,8 @@ mod tests {
     #[test]
     fn write_then_load_round_trip() {
         let dir = tempdir().unwrap();
-        let kp = KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
         let mut m = sample();
         m.sign(&kp).unwrap();
         let path = dir.path().join("m.json");

@@ -2,6 +2,12 @@
 //! over stdin. Returns Events the caller can act on, along with the
 //! raw line bytes so they can be forwarded into the encrypted output
 //! verbatim.
+//!
+//! Many fields are populated even though the current main.rs flow does
+//! not read all of them — rotation (deferred Track B follow-up) and
+//! future playback/indexing will. Dead-code allowed module-wide.
+
+#![allow(dead_code)]
 
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
@@ -11,11 +17,23 @@ use crate::error::KatagraphoError;
 #[derive(Debug, Clone)]
 pub enum Event {
     Header(HeaderInfo),
-    Out { t: f64 },
-    In { t: f64 },
-    Resize { t: f64, cols: u16, rows: u16 },
+    Out {
+        t: f64,
+    },
+    In {
+        t: f64,
+    },
+    Resize {
+        t: f64,
+        cols: u16,
+        rows: u16,
+    },
     Chunk(ChunkInfo),
-    End { t: f64, reason: String, exit_code: i32 },
+    End {
+        t: f64,
+        reason: String,
+        exit_code: i32,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -7,17 +7,17 @@
 
 #![allow(dead_code)]
 
-#[path = "../src/error.rs"]
-mod error;
-#[path = "../src/signing.rs"]
-mod signing;
-#[path = "../src/manifest.rs"]
-mod manifest;
-#[path = "../src/verify.rs"]
-mod verify;
 #[path = "../src/chain.rs"]
 #[allow(dead_code)]
 mod chain;
+#[path = "../src/error.rs"]
+mod error;
+#[path = "../src/manifest.rs"]
+mod manifest;
+#[path = "../src/signing.rs"]
+mod signing;
+#[path = "../src/verify.rs"]
+mod verify;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -100,7 +100,10 @@ fn main() {
     };
 
     if !pub_path.exists() {
-        eprintln!("katagrapho-verify: pubkey not found at {}", pub_path.display());
+        eprintln!(
+            "katagrapho-verify: pubkey not found at {}",
+            pub_path.display()
+        );
         exit(EX_NOINPUT);
     }
     let pub_bytes = std::fs::read(&pub_path).unwrap_or_default();
