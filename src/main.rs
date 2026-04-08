@@ -9,6 +9,7 @@
 
 mod error;
 mod finalize;
+mod signing;
 
 use crate::error::KatagraphoError;
 use std::ffi::{CStr, CString};
