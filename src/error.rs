@@ -10,6 +10,7 @@ pub const EX_NOINPUT: i32 = 66;
 pub const EX_SOFTWARE: i32 = 70;
 pub const EX_IOERR: i32 = 74;
 pub const EX_NOPERM: i32 = 77;
+pub const EX_CONFIG: i32 = 78;
 
 #[derive(Debug, thiserror::Error)]
 pub enum KatagraphoError {
@@ -34,6 +35,30 @@ pub enum KatagraphoError {
     #[error("io: {0}")]
     Io(#[from] io::Error),
 
+    #[error("manifest: {0}")]
+    #[allow(dead_code)]
+    Manifest(String),
+
+    #[error("signing: {0}")]
+    #[allow(dead_code)]
+    Signing(String),
+
+    #[error("verify: {0}")]
+    #[allow(dead_code)]
+    Verify(String),
+
+    #[error("chain: {0}")]
+    #[allow(dead_code)]
+    Chain(String),
+
+    #[error("config: {0}")]
+    #[allow(dead_code)]
+    Config(String),
+
+    #[error("stream: {0}")]
+    #[allow(dead_code)]
+    Stream(String),
+
     #[error("internal: {0}")]
     #[allow(dead_code)]
     Internal(String),
@@ -49,6 +74,12 @@ impl KatagraphoError {
             Self::Storage(_) => EX_IOERR,
             Self::Encryption(_) => EX_IOERR,
             Self::Io(_) => EX_IOERR,
+            Self::Manifest(_) => EX_IOERR,
+            Self::Signing(_) => EX_SOFTWARE,
+            Self::Verify(_) => EX_DATAERR,
+            Self::Chain(_) => EX_IOERR,
+            Self::Config(_) => EX_CONFIG,
+            Self::Stream(_) => EX_DATAERR,
             Self::Internal(_) => EX_SOFTWARE,
         }
     }
