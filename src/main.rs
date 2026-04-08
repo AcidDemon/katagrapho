@@ -10,6 +10,7 @@
 mod chain;
 mod error;
 mod finalize;
+mod kata_config;
 mod manifest;
 mod signing;
 
