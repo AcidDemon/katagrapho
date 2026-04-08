@@ -621,65 +621,20 @@ fn run() -> Result<(), KatagraphoError> {
     // SAFETY: file_fd is a valid, exclusively-owned file descriptor.
     let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
 
-    let result: Result<u64, KatagraphoError> = if let Some(ref recipient_path) = args.recipient_file
-    {
-        use crate::finalize::EncryptionFinalizer;
-        let recipients = load_recipients(recipient_path)?;
-        let recipients_ref: Vec<&dyn age::Recipient> = recipients
-            .iter()
-            .map(|r| r.as_ref() as &dyn age::Recipient)
-            .collect();
-        let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
-            .map_err(|e| KatagraphoError::Encryption(format!("setup: {e}")))?;
-        let inner = encryptor
-            .wrap_output(&mut file)
-            .map_err(|e| KatagraphoError::Encryption(format!("init: {e}")))?;
-        let mut fin = EncryptionFinalizer::new(inner);
+    // Load signing key + chain paths from config (defaults apply if no --config).
+    let kata_cfg = crate::kata_config::KataConfig::default();
+    let signing_key = crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
+    let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
 
-        let res = stream_stdin(&mut fin);
+    // Process the kgv1 stream: forward raw bytes into the encrypted file,
+    // collect chunks and the header for the manifest.
+    let v1_result = process_v1_stream(&mut file, &args.recipient_file);
 
-        // Always write termination marker if we were signalled or if the
-        // stream errored — BEFORE finish(), so it lives inside the encrypted blob.
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            write_termination_marker(&mut fin, "signal");
-        } else if let Err(ref e) = res {
-            write_termination_marker(&mut fin, &format!("{e}"));
-        }
+    file.sync_all().map_err(KatagraphoError::Io)?;
 
-        // ALWAYS finalize, regardless of res. If finalize itself fails,
-        // surface that as an Encryption error overriding any prior error.
-        fin.finish()
-            .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
-
-        res
-    } else {
-        let res = stream_stdin(&mut file);
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            write_termination_marker(&mut file, "signal");
-        } else if let Err(ref e) = res {
-            write_termination_marker(&mut file, &format!("{e}"));
-        }
-        res
-    };
-
-    match result {
-        Ok(bytes) => {
-            file.sync_all().map_err(KatagraphoError::Io)?;
-            syslog_msg(
-                libc::LOG_INFO,
-                &format!(
-                    "session end: user={username} session_id={} file={} bytes={bytes}",
-                    args.session_id,
-                    output_path.display(),
-                ),
-            );
-            close_syslog();
-            Ok(())
-        }
+    let (header_info, chunks, end_reason, exit_code) = match v1_result {
+        Ok(t) => t,
         Err(e) => {
-            // Termination marker (if any) was already written into the
-            // file/encryption stream above, before this match.
-            let _ = file.sync_all();
             syslog_msg(
                 libc::LOG_ERR,
                 &format!(
@@ -688,9 +643,297 @@ fn run() -> Result<(), KatagraphoError> {
                 ),
             );
             close_syslog();
-            Err(e)
+            return Err(e);
+        }
+    };
+
+    // If signing key loaded, write manifest + advance chain. If not (e.g.
+    // test env or missing key), log a warning but succeed — recording is
+    // complete, just not attested.
+    if let Ok(key) = signing_key {
+        if let Err(e) = write_manifest_and_advance(
+            &key,
+            &chain_paths,
+            &output_path,
+            &username,
+            &args.session_id,
+            &header_info,
+            &chunks,
+            &end_reason,
+            exit_code,
+        ) {
+            syslog_msg(
+                libc::LOG_ERR,
+                &format!(
+                    "manifest write failed: user={username} session_id={}: {e}",
+                    args.session_id
+                ),
+            );
+            // Continue: the recording itself is on disk, just unsigned.
+        }
+    } else {
+        syslog_msg(
+            libc::LOG_WARNING,
+            &format!(
+                "no signing key at {}; recording written without manifest",
+                kata_cfg.signing.key_path.display()
+            ),
+        );
+    }
+
+    syslog_msg(
+        libc::LOG_INFO,
+        &format!(
+            "session end: user={username} session_id={} file={} chunks={}",
+            args.session_id,
+            output_path.display(),
+            chunks.len(),
+        ),
+    );
+    close_syslog();
+    Ok(())
+}
+
+/// Parse the kgv1 stream from stdin, forward every record into the
+/// encrypted (or plaintext) output file, and collect the header + chunks.
+fn process_v1_stream(
+    file: &mut fs::File,
+    recipient_file: &Option<String>,
+) -> Result<
+    (
+        crate::stream::HeaderInfo,
+        Vec<crate::manifest::Chunk>,
+        String,
+        i32,
+    ),
+    KatagraphoError,
+> {
+    use crate::finalize::EncryptionFinalizer;
+    use crate::stream::{Event, Reader as StreamReader};
+
+    let stdin = io::stdin();
+    let locked = stdin.lock();
+    let mut reader = StreamReader::new(locked);
+
+    let mut header_info: Option<crate::stream::HeaderInfo> = None;
+    let mut chunks: Vec<crate::manifest::Chunk> = Vec::new();
+    let mut end_reason = "eof".to_string();
+    let mut exit_code = 0;
+
+    // Encrypted path
+    if let Some(recipient_path) = recipient_file {
+        let recipients = load_recipients(recipient_path)?;
+        let recipients_ref: Vec<&dyn age::Recipient> = recipients
+            .iter()
+            .map(|r| r.as_ref() as &dyn age::Recipient)
+            .collect();
+        let encryptor = age::Encryptor::with_recipients(recipients_ref.into_iter())
+            .map_err(|e| KatagraphoError::Encryption(format!("setup: {e}")))?;
+        let inner = encryptor
+            .wrap_output(file)
+            .map_err(|e| KatagraphoError::Encryption(format!("init: {e}")))?;
+        let mut fin = EncryptionFinalizer::new(inner);
+
+        while let Some((event, raw)) = reader.next_event()? {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                end_reason = "signal".to_string();
+                break;
+            }
+            fin.write_all(&raw).map_err(KatagraphoError::Io)?;
+            match event {
+                Event::Header(h) => {
+                    if header_info.is_some() {
+                        return Err(KatagraphoError::Stream(
+                            "second header record".to_string(),
+                        ));
+                    }
+                    header_info = Some(h);
+                }
+                Event::Chunk(c) => {
+                    chunks.push(crate::manifest::Chunk {
+                        seq: c.seq,
+                        bytes: c.bytes,
+                        messages: c.messages,
+                        elapsed: c.elapsed,
+                        sha256: c.sha256_hex,
+                    });
+                }
+                Event::End { reason, exit_code: ec, .. } => {
+                    end_reason = reason;
+                    exit_code = ec;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        fin.finish()
+            .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
+    } else {
+        // Plaintext path
+        while let Some((event, raw)) = reader.next_event()? {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                end_reason = "signal".to_string();
+                break;
+            }
+            file.write_all(&raw).map_err(KatagraphoError::Io)?;
+            match event {
+                Event::Header(h) => {
+                    if header_info.is_some() {
+                        return Err(KatagraphoError::Stream(
+                            "second header record".to_string(),
+                        ));
+                    }
+                    header_info = Some(h);
+                }
+                Event::Chunk(c) => {
+                    chunks.push(crate::manifest::Chunk {
+                        seq: c.seq,
+                        bytes: c.bytes,
+                        messages: c.messages,
+                        elapsed: c.elapsed,
+                        sha256: c.sha256_hex,
+                    });
+                }
+                Event::End { reason, exit_code: ec, .. } => {
+                    end_reason = reason;
+                    exit_code = ec;
+                    break;
+                }
+                _ => {}
+            }
         }
     }
+
+    let header =
+        header_info.ok_or_else(|| KatagraphoError::Stream("stream had no header".to_string()))?;
+    Ok((header, chunks, end_reason, exit_code))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_manifest_and_advance(
+    key: &crate::signing::KeyPair,
+    chain_paths: &crate::chain::ChainPaths,
+    recording_path: &Path,
+    username: &str,
+    session_id: &str,
+    header: &crate::stream::HeaderInfo,
+    chunks: &[crate::manifest::Chunk],
+    end_reason: &str,
+    exit_code: i32,
+) -> Result<(), KatagraphoError> {
+    let recording_sha256 = sha256_file(recording_path)?;
+    let recording_size = fs::metadata(recording_path)
+        .map_err(|e| KatagraphoError::Manifest(format!("stat recording: {e}")))?
+        .len();
+
+    let _lock = crate::chain::ChainLock::acquire(chain_paths)?;
+    let prev = crate::chain::read_head(chain_paths)?;
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let mut manifest = crate::manifest::Manifest {
+        v: crate::manifest::MANIFEST_VERSION.to_string(),
+        session_id: session_id.to_string(),
+        part: 0,
+        user: username.to_string(),
+        host: header.host.clone(),
+        boot_id: header.boot_id.clone(),
+        audit_session_id: header.audit_session_id,
+        started: header.started,
+        ended: now_unix,
+        katagrapho_version: env!("CARGO_PKG_VERSION").to_string(),
+        katagrapho_commit: env!("KATAGRAPHO_GIT_COMMIT").to_string(),
+        epitropos_version: header.epitropos_version.clone(),
+        epitropos_commit: header.epitropos_commit.clone(),
+        recording_file: recording_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string(),
+        recording_size,
+        recording_sha256,
+        chunks: chunks.to_vec(),
+        end_reason: end_reason.to_string(),
+        exit_code,
+        prev_manifest_hash: prev,
+        this_manifest_hash: String::new(),
+        key_id: String::new(),
+        signature: String::new(),
+    };
+    manifest.sign(key)?;
+
+    let sidecar = sidecar_path_for(recording_path);
+    manifest.write_to(&sidecar)?;
+
+    crate::chain::write_head(chain_paths, &manifest.this_manifest_hash)?;
+
+    let iso_now = iso_timestamp_utc();
+    crate::chain::append_log(
+        chain_paths,
+        &iso_now,
+        username,
+        session_id,
+        0,
+        &manifest.this_manifest_hash,
+    )?;
+
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, KatagraphoError> {
+    use sha2::{Digest, Sha256};
+    let mut f = fs::File::open(path)
+        .map_err(|e| KatagraphoError::Manifest(format!("open recording: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = Read::read(&mut f, &mut buf)
+            .map_err(|e| KatagraphoError::Manifest(format!("read recording: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn sidecar_path_for(recording: &Path) -> PathBuf {
+    let mut s = recording.as_os_str().to_os_string();
+    s.push(".manifest.json");
+    PathBuf::from(s)
+}
+
+fn iso_timestamp_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let hms = secs % 86400;
+    let h = hms / 3600;
+    let m = (hms % 3600) / 60;
+    let s = hms % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Howard Hinnant's days-from-civil conversion. Input: days since 1970-01-01.
+fn days_to_ymd(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 fn main() {
