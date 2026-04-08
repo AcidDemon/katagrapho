@@ -118,7 +118,23 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${cfg.storageDir} 2750 ${cfg.user} ${cfg.group} -"
+      "d /var/lib/katagrapho 0750 ${cfg.user} ${cfg.group} -"
     ];
+
+    systemd.services.katagrapho-keygen = {
+      description = "Generate katagrapho ed25519 signing key (first boot only)";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "local-fs.target" ];
+      unitConfig = {
+        ConditionPathExists = "!/var/lib/katagrapho/signing.key";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = "${cfg.package}/bin/katagrapho-keygen";
+        User = "root";
+        RemainAfterExit = true;
+      };
+    };
 
     security.wrappers.katagrapho = {
       source = lib.getExe cfg.package;
