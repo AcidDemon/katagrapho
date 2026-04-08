@@ -9,6 +9,7 @@
 
 mod error;
 mod finalize;
+mod manifest;
 mod signing;
 
 use crate::error::KatagraphoError;
