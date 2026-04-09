@@ -510,20 +510,16 @@ fn run() -> Result<(), KatagraphoError> {
     )?;
 
     let user_dir = ensure_user_dir(&username)?;
-    let filename = format!("{}{}", args.session_id, args.suffix);
-    let output_path = user_dir.join(&filename);
 
-    // Verify the assembled path stays within STORAGE_DIR.
-    // Path::starts_with checks component boundaries correctly.
-    if !output_path.starts_with(STORAGE_DIR) {
+    // Verify the user dir stays within STORAGE_DIR. Per-part filenames
+    // are validated at openat time via O_NOFOLLOW.
+    if !user_dir.starts_with(STORAGE_DIR) {
         return Err(KatagraphoError::Storage(
             "path escapes storage directory".to_string(),
         ));
     }
 
-    // Open the user directory with O_DIRECTORY | O_NOFOLLOW to get a
-    // race-free file descriptor. This prevents TOCTOU attacks where the
-    // directory is replaced with a symlink between validation and file open.
+    // Open the user directory once; reuse the fd across all parts.
     let dir_cstr =
         CString::new(user_dir.to_str().ok_or_else(|| {
             KatagraphoError::Storage("user directory path not UTF-8".to_string())
@@ -544,141 +540,210 @@ fn run() -> Result<(), KatagraphoError> {
         )));
     }
 
-    // Use openat() relative to the directory fd to create the file.
-    // O_CREAT|O_EXCL: atomic create, fail if exists.
-    // O_NOFOLLOW: refuse to follow symlinks in the filename.
-    // Mode 0440: read-only for owner (session-writer) + group (ssh-sessions).
-    let filename_cstr = CString::new(filename.as_str())
-        .map_err(|_| KatagraphoError::Storage("filename contains null byte".to_string()))?;
-
-    let file_fd = unsafe {
-        libc::openat(
-            dir_fd,
-            filename_cstr.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o0440 as libc::c_uint,
-        )
-    };
-
-    // Close the directory fd regardless of openat result.
-    unsafe {
-        libc::close(dir_fd);
-    }
-
-    if file_fd < 0 {
-        return Err(KatagraphoError::Storage(format!(
-            "open '{}': {}",
-            output_path.display(),
-            io::Error::last_os_error()
-        )));
-    }
-
-    // SAFETY: file_fd is a valid, exclusively-owned file descriptor.
-    let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
-
-    // Load signing key + chain paths from config (defaults apply if no --config).
+    // Load signing key + chain paths + storage limits from config.
     let kata_cfg = crate::kata_config::KataConfig::default();
     let signing_key =
         crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
     let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
 
-    // Process the kgv1 stream: forward raw bytes into the encrypted file,
-    // collect chunks and the header for the manifest.
-    let v1_result = process_v1_stream(&mut file, &args.recipient_file);
+    // Per-part loop with rotation. Session-global state carries across parts.
+    let stdin = io::stdin();
+    let locked = stdin.lock();
+    let mut reader = crate::stream::Reader::new(locked);
 
-    file.sync_all().map_err(KatagraphoError::Io)?;
+    let mut first_header_raw: Option<serde_json::Value> = None;
+    let mut first_header_info: Option<crate::stream::HeaderInfo> = None;
+    let mut prev_manifest_hash_link: Option<String> = None;
+    let mut session_bytes: u64 = 0;
+    let mut part_num: u32 = 0;
+    let mut total_chunks: usize = 0;
+    let mut hit_session_limit = false;
 
-    let (header_info, chunks, end_reason, exit_code) = match v1_result {
-        Ok(t) => t,
-        Err(e) => {
+    'per_part: loop {
+        let filename = format!("{}.part{}{}", args.session_id, part_num, args.suffix);
+        let output_path = user_dir.join(&filename);
+
+        let filename_cstr = CString::new(filename.as_str())
+            .map_err(|_| KatagraphoError::Storage("filename contains null byte".to_string()))?;
+
+        let file_fd = unsafe {
+            libc::openat(
+                dir_fd,
+                filename_cstr.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o0440 as libc::c_uint,
+            )
+        };
+        if file_fd < 0 {
+            unsafe { libc::close(dir_fd) };
+            return Err(KatagraphoError::Storage(format!(
+                "open '{}': {}",
+                output_path.display(),
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: file_fd is exclusively owned here.
+        let mut file = unsafe { fs::File::from_raw_fd(file_fd) };
+
+        // For part N > 0 synthesize a header by mutating the original
+        // raw JSON with the new part number and prev_manifest_hash_link.
+        let synthetic_header_bytes: Option<Vec<u8>> = match (part_num, first_header_raw.as_ref()) {
+            (0, _) | (_, None) => None,
+            (_, Some(orig)) => {
+                let mut v = orig.clone();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("part".to_string(), serde_json::Value::from(part_num));
+                    obj.insert(
+                        "prev_manifest_hash_link".to_string(),
+                        prev_manifest_hash_link
+                            .as_deref()
+                            .map(serde_json::Value::from)
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                let mut line = serde_json::to_vec(&v)
+                    .map_err(|e| KatagraphoError::Stream(format!("header synth: {e}")))?;
+                line.push(b'\n');
+                Some(line)
+            }
+        };
+
+        let outcome = process_part(
+            &mut reader,
+            &mut file,
+            &args.recipient_file,
+            synthetic_header_bytes.as_deref(),
+            kata_cfg.storage.max_file_bytes,
+            kata_cfg.storage.max_session_bytes,
+            &mut session_bytes,
+        )?;
+
+        file.sync_all().map_err(KatagraphoError::Io)?;
+
+        // Capture part 0's header for reuse across subsequent parts.
+        if part_num == 0 {
+            first_header_raw = Some(outcome.header_info.raw.clone());
+            first_header_info = Some(outcome.header_info.clone());
+        }
+        let base_header = first_header_info.as_ref().unwrap();
+        total_chunks += outcome.chunks.len();
+
+        // Write signed manifest + advance chain.
+        let mut part_manifest_hash: Option<String> = None;
+        if let Ok(ref key) = signing_key {
+            match write_manifest_and_advance(
+                key,
+                &chain_paths,
+                &output_path,
+                &username,
+                &args.session_id,
+                base_header,
+                part_num,
+                prev_manifest_hash_link.as_deref(),
+                &outcome.chunks,
+                &outcome.end_reason,
+                outcome.exit_code,
+            ) {
+                Ok(hash) => part_manifest_hash = Some(hash),
+                Err(e) => {
+                    syslog_msg(
+                        libc::LOG_ERR,
+                        &format!(
+                            "manifest write failed: user={username} session_id={} part={part_num}: {e}",
+                            args.session_id
+                        ),
+                    );
+                }
+            }
+        } else {
             syslog_msg(
-                libc::LOG_ERR,
+                libc::LOG_WARNING,
                 &format!(
-                    "session error: user={username} session_id={}: {e}",
-                    args.session_id
+                    "no signing key at {}; part {part_num} written without manifest",
+                    kata_cfg.signing.key_path.display()
                 ),
             );
-            close_syslog();
-            return Err(e);
         }
-    };
 
-    // If signing key loaded, write manifest + advance chain. If not (e.g.
-    // test env or missing key), log a warning but succeed — recording is
-    // complete, just not attested.
-    if let Ok(key) = signing_key {
-        if let Err(e) = write_manifest_and_advance(
-            &key,
-            &chain_paths,
-            &output_path,
-            &username,
-            &args.session_id,
-            &header_info,
-            &chunks,
-            &end_reason,
-            exit_code,
-        ) {
-            syslog_msg(
-                libc::LOG_ERR,
-                &format!(
-                    "manifest write failed: user={username} session_id={}: {e}",
-                    args.session_id
-                ),
-            );
-            // Continue: the recording itself is on disk, just unsigned.
+        match outcome.next {
+            PartNext::EndOfStream => break 'per_part,
+            PartNext::SessionSizeLimit => {
+                hit_session_limit = true;
+                break 'per_part;
+            }
+            PartNext::Rotated => {
+                prev_manifest_hash_link = part_manifest_hash;
+                part_num = part_num.saturating_add(1);
+                continue 'per_part;
+            }
         }
-    } else {
-        syslog_msg(
-            libc::LOG_WARNING,
-            &format!(
-                "no signing key at {}; recording written without manifest",
-                kata_cfg.signing.key_path.display()
-            ),
-        );
     }
+
+    unsafe { libc::close(dir_fd) };
 
     syslog_msg(
         libc::LOG_INFO,
         &format!(
-            "session end: user={username} session_id={} file={} chunks={}",
+            "session end: user={username} session_id={} parts={} chunks={}",
             args.session_id,
-            output_path.display(),
-            chunks.len(),
+            part_num + 1,
+            total_chunks,
         ),
     );
     close_syslog();
+
+    if hit_session_limit {
+        return Err(KatagraphoError::Storage(
+            "session exceeded max_session_bytes".to_string(),
+        ));
+    }
     Ok(())
 }
 
-/// Parse the kgv1 stream from stdin, forward every record into the
-/// encrypted (or plaintext) output file, and collect the header + chunks.
-fn process_v1_stream(
+#[derive(Debug)]
+enum PartNext {
+    EndOfStream,
+    Rotated,
+    SessionSizeLimit,
+}
+
+struct PartOutcome {
+    header_info: crate::stream::HeaderInfo,
+    chunks: Vec<crate::manifest::Chunk>,
+    end_reason: String,
+    exit_code: i32,
+    next: PartNext,
+}
+
+/// Process a single part of the recording. For part 0 the header
+/// comes from the stream; for part N > 0 the caller provides a
+/// synthetic header line (`synth_header`) which is written into the
+/// new file before the reader is resumed.
+#[allow(clippy::too_many_arguments)]
+fn process_part<R: std::io::BufRead + std::io::Read>(
+    reader: &mut crate::stream::Reader<R>,
     file: &mut fs::File,
     recipient_file: &Option<String>,
-) -> Result<
-    (
-        crate::stream::HeaderInfo,
-        Vec<crate::manifest::Chunk>,
-        String,
-        i32,
-    ),
-    KatagraphoError,
-> {
+    synth_header: Option<&[u8]>,
+    max_file_bytes: u64,
+    max_session_bytes: u64,
+    session_bytes: &mut u64,
+) -> Result<PartOutcome, KatagraphoError> {
     use crate::finalize::EncryptionFinalizer;
-    use crate::stream::{Event, Reader as StreamReader};
-
-    let stdin = io::stdin();
-    let locked = stdin.lock();
-    let mut reader = StreamReader::new(locked);
 
     let mut header_info: Option<crate::stream::HeaderInfo> = None;
     let mut chunks: Vec<crate::manifest::Chunk> = Vec::new();
     let mut end_reason = "eof".to_string();
     let mut exit_code = 0;
+    let mut next = PartNext::EndOfStream;
+    let mut part_bytes: u64 = 0;
 
-    // Encrypted path
-    if let Some(recipient_path) = recipient_file {
-        let recipients = load_recipients(recipient_path)?;
+    // Route through a single `&mut dyn Write` to avoid double-borrowing
+    // `file`. For the encrypted path the writer IS the EncryptionFinalizer
+    // which borrows `file` internally; we keep it alive in a local and
+    // call `.finish()` before returning.
+    if recipient_file.is_some() {
+        let recipients = load_recipients(recipient_file.as_ref().unwrap())?;
         let recipients_ref: Vec<&dyn age::Recipient> = recipients
             .iter()
             .map(|r| r.as_ref() as &dyn age::Recipient)
@@ -690,84 +755,146 @@ fn process_v1_stream(
             .map_err(|e| KatagraphoError::Encryption(format!("init: {e}")))?;
         let mut fin = EncryptionFinalizer::new(inner);
 
-        while let Some((event, raw)) = reader.next_event()? {
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                end_reason = "signal".to_string();
-                break;
-            }
-            fin.write_all(&raw).map_err(KatagraphoError::Io)?;
-            match event {
-                Event::Header(h) => {
-                    if header_info.is_some() {
-                        return Err(KatagraphoError::Stream("second header record".to_string()));
-                    }
-                    header_info = Some(h);
-                }
-                Event::Chunk(c) => {
-                    chunks.push(crate::manifest::Chunk {
-                        seq: c.seq,
-                        bytes: c.bytes,
-                        messages: c.messages,
-                        elapsed: c.elapsed,
-                        sha256: c.sha256_hex,
-                    });
-                }
-                Event::End {
-                    reason,
-                    exit_code: ec,
-                    ..
-                } => {
-                    end_reason = reason;
-                    exit_code = ec;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        run_part_loop(
+            reader,
+            &mut fin,
+            synth_header,
+            max_file_bytes,
+            max_session_bytes,
+            session_bytes,
+            &mut part_bytes,
+            &mut header_info,
+            &mut chunks,
+            &mut end_reason,
+            &mut exit_code,
+            &mut next,
+        )?;
 
         fin.finish()
             .map_err(|e| KatagraphoError::Encryption(format!("finalize: {e}")))?;
     } else {
-        // Plaintext path
-        while let Some((event, raw)) = reader.next_event()? {
-            if SHUTDOWN.load(Ordering::SeqCst) {
-                end_reason = "signal".to_string();
-                break;
-            }
-            file.write_all(&raw).map_err(KatagraphoError::Io)?;
-            match event {
-                Event::Header(h) => {
-                    if header_info.is_some() {
-                        return Err(KatagraphoError::Stream("second header record".to_string()));
-                    }
-                    header_info = Some(h);
-                }
-                Event::Chunk(c) => {
-                    chunks.push(crate::manifest::Chunk {
-                        seq: c.seq,
-                        bytes: c.bytes,
-                        messages: c.messages,
-                        elapsed: c.elapsed,
-                        sha256: c.sha256_hex,
-                    });
-                }
-                Event::End {
-                    reason,
-                    exit_code: ec,
-                    ..
-                } => {
-                    end_reason = reason;
-                    exit_code = ec;
-                    break;
-                }
-                _ => {}
-            }
-        }
+        run_part_loop(
+            reader,
+            file,
+            synth_header,
+            max_file_bytes,
+            max_session_bytes,
+            session_bytes,
+            &mut part_bytes,
+            &mut header_info,
+            &mut chunks,
+            &mut end_reason,
+            &mut exit_code,
+            &mut next,
+        )?;
     }
 
     let header =
         header_info.ok_or_else(|| KatagraphoError::Stream("stream had no header".to_string()))?;
-    Ok((header, chunks, end_reason, exit_code))
+
+    Ok(PartOutcome {
+        header_info: header,
+        chunks,
+        end_reason,
+        exit_code,
+        next,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_part_loop<R: std::io::BufRead + std::io::Read, W: Write>(
+    reader: &mut crate::stream::Reader<R>,
+    writer: &mut W,
+    synth_header: Option<&[u8]>,
+    max_file_bytes: u64,
+    max_session_bytes: u64,
+    session_bytes: &mut u64,
+    part_bytes: &mut u64,
+    header_info: &mut Option<crate::stream::HeaderInfo>,
+    chunks: &mut Vec<crate::manifest::Chunk>,
+    end_reason: &mut String,
+    exit_code: &mut i32,
+    next: &mut PartNext,
+) -> Result<(), KatagraphoError> {
+    use crate::stream::Event;
+
+    // Synthetic header for parts > 0.
+    if let Some(bytes) = synth_header {
+        writer.write_all(bytes).map_err(KatagraphoError::Io)?;
+        *part_bytes += bytes.len() as u64;
+        *session_bytes += bytes.len() as u64;
+        let s = std::str::from_utf8(bytes)
+            .map_err(|e| KatagraphoError::Stream(format!("synth header utf8: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(s.trim())
+            .map_err(|e| KatagraphoError::Stream(format!("synth header parse: {e}")))?;
+        *header_info = Some(crate::stream::HeaderInfo {
+            session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
+            user: v["user"].as_str().unwrap_or_default().to_string(),
+            host: v["host"].as_str().unwrap_or_default().to_string(),
+            boot_id: v["boot_id"].as_str().unwrap_or_default().to_string(),
+            part: v["part"].as_u64().unwrap_or(0) as u32,
+            started: v["started"].as_f64().unwrap_or(0.0),
+            epitropos_version: v["epitropos_version"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            epitropos_commit: v["epitropos_commit"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            audit_session_id: v["audit_session_id"].as_u64().map(|x| x as u32),
+            raw: v,
+        });
+    }
+
+    while let Some((event, raw)) = reader.next_event()? {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            *end_reason = "signal".to_string();
+            break;
+        }
+        writer.write_all(&raw).map_err(KatagraphoError::Io)?;
+        *part_bytes += raw.len() as u64;
+        *session_bytes += raw.len() as u64;
+
+        match event {
+            Event::Header(h) => {
+                if header_info.is_some() {
+                    return Err(KatagraphoError::Stream("second header record".to_string()));
+                }
+                *header_info = Some(h);
+            }
+            Event::Chunk(c) => {
+                chunks.push(crate::manifest::Chunk {
+                    seq: c.seq,
+                    bytes: c.bytes,
+                    messages: c.messages,
+                    elapsed: c.elapsed,
+                    sha256: c.sha256_hex,
+                });
+                if *session_bytes >= max_session_bytes {
+                    *end_reason = "session_size_limit".to_string();
+                    *next = PartNext::SessionSizeLimit;
+                    break;
+                }
+                if *part_bytes >= max_file_bytes {
+                    *end_reason = "rotated".to_string();
+                    *next = PartNext::Rotated;
+                    break;
+                }
+            }
+            Event::End {
+                reason,
+                exit_code: ec,
+                ..
+            } => {
+                *end_reason = reason;
+                *exit_code = ec;
+                break;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -778,10 +905,12 @@ fn write_manifest_and_advance(
     username: &str,
     session_id: &str,
     header: &crate::stream::HeaderInfo,
+    part: u32,
+    _prev_manifest_hash_link: Option<&str>,
     chunks: &[crate::manifest::Chunk],
     end_reason: &str,
     exit_code: i32,
-) -> Result<(), KatagraphoError> {
+) -> Result<String, KatagraphoError> {
     let recording_sha256 = sha256_file(recording_path)?;
     let recording_size = fs::metadata(recording_path)
         .map_err(|e| KatagraphoError::Manifest(format!("stat recording: {e}")))?
@@ -798,7 +927,7 @@ fn write_manifest_and_advance(
     let mut manifest = crate::manifest::Manifest {
         v: crate::manifest::MANIFEST_VERSION.to_string(),
         session_id: session_id.to_string(),
-        part: 0,
+        part,
         user: username.to_string(),
         host: header.host.clone(),
         boot_id: header.boot_id.clone(),
@@ -837,11 +966,11 @@ fn write_manifest_and_advance(
         &iso_now,
         username,
         session_id,
-        0,
+        part,
         &manifest.this_manifest_hash,
     )?;
 
-    Ok(())
+    Ok(manifest.this_manifest_hash)
 }
 
 fn sha256_file(path: &Path) -> Result<String, KatagraphoError> {
