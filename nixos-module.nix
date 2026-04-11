@@ -108,6 +108,12 @@ in
         (config.services.epitropos.proxyUser or "session-proxy");
     };
 
+    # Dedicated read-only group for daemons that need to ship or inspect
+    # katagrapho state (e.g. epitropos-forward). Kept separate from
+    # ${cfg.group} (ssh-sessions) so that shipping daemons don't inherit
+    # every future perm attached to the recording-access group.
+    users.groups.katagrapho-readers = { };
+
     users.users.${cfg.user} = {
       isSystemUser = true;
       group = cfg.group;
@@ -117,8 +123,14 @@ in
     };
 
     systemd.tmpfiles.rules = [
-      "d ${cfg.storageDir} 2750 ${cfg.user} ${cfg.group} -"
-      "d /var/lib/katagrapho 0750 ${cfg.user} ${cfg.group} -"
+      "d ${cfg.storageDir} 2750 ${cfg.user} katagrapho-readers -"
+      "d /var/lib/katagrapho 0750 ${cfg.user} katagrapho-readers -"
+      # Re-chown recording corpus group to katagrapho-readers on every
+      # boot so upgrades from pre-Track-C installs take effect without
+      # a manual migration.
+      "z ${cfg.storageDir} 2750 ${cfg.user} katagrapho-readers -"
+      "z /var/lib/katagrapho/head.hash.log 0640 ${cfg.user} katagrapho-readers -"
+      "z /var/lib/katagrapho/signing.pub 0640 ${cfg.user} katagrapho-readers -"
     ];
 
     systemd.services.katagrapho-keygen = {
