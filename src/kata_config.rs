@@ -103,7 +103,6 @@ impl Default for Chain {
 }
 
 impl KataConfig {
-    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self, KatagraphoError> {
         let s = fs::read_to_string(path)
             .map_err(|e| KatagraphoError::Config(format!("read {}: {e}", path.display())))?;

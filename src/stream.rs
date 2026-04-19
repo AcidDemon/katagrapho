@@ -78,6 +78,10 @@ impl<R: Read> Reader<R> {
     /// Read the next event. Returns Ok(None) on EOF. On success,
     /// returns the event plus the raw bytes (including trailing \n)
     /// for forwarding into the encrypted output.
+    /// Maximum line length (16 MiB). Prevents memory exhaustion from a
+    /// malicious or malformed stream sending a single enormous line.
+    const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
     pub fn next_event(&mut self) -> Result<Option<(Event, Vec<u8>)>, KatagraphoError> {
         self.line_buf.clear();
         let n = self
@@ -86,6 +90,12 @@ impl<R: Read> Reader<R> {
             .map_err(|e| KatagraphoError::Stream(format!("read: {e}")))?;
         if n == 0 {
             return Ok(None);
+        }
+        if n > Self::MAX_LINE_BYTES {
+            return Err(KatagraphoError::Stream(format!(
+                "line too long ({n} bytes, max {})",
+                Self::MAX_LINE_BYTES
+            )));
         }
         self.bytes_read += n as u64;
         let raw_bytes = self.line_buf.as_bytes().to_vec();

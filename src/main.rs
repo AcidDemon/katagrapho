@@ -541,7 +541,12 @@ fn run() -> Result<(), KatagraphoError> {
     }
 
     // Load signing key + chain paths + storage limits from config.
-    let kata_cfg = crate::kata_config::KataConfig::default();
+    let config_path = std::path::Path::new("/etc/katagrapho/config.toml");
+    let kata_cfg = if config_path.exists() {
+        crate::kata_config::KataConfig::load(config_path)?
+    } else {
+        crate::kata_config::KataConfig::default()
+    };
     let signing_key =
         crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
     let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
@@ -655,11 +660,11 @@ fn run() -> Result<(), KatagraphoError> {
                     );
                 }
             }
-        } else {
+        } else if let Err(ref e) = signing_key {
             syslog_msg(
-                libc::LOG_WARNING,
+                libc::LOG_CRIT,
                 &format!(
-                    "no signing key at {}; part {part_num} written without manifest",
+                    "signing key unavailable at {}: {e}; recording written WITHOUT integrity guarantee",
                     kata_cfg.signing.key_path.display()
                 ),
             );
