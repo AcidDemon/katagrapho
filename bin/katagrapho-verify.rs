@@ -32,9 +32,10 @@ const EX_MANIFEST_MALFORMED: i32 = 4;
 
 fn print_usage() {
     eprintln!(
-        "Usage: katagrapho-verify [--check-chain] [--with-key <age-identity>] [--pub <pubkey>] <path>\n\
+        "Usage: katagrapho-verify [--check-chain] [--with-key <age-identity>] [--pub <pubkey>] [--chain-dir <dir>] <path>\n\
          \n\
          <path> may be a sidecar manifest or a directory of manifests.\n\
+         --check-chain also anchors to <chain-dir>/head.hash to detect tail truncation.\n\
          \n\
          Exit codes:\n\
            0   verified\n\
@@ -53,6 +54,7 @@ fn main() {
     let mut check_chain = false;
     let mut with_key: Option<PathBuf> = None;
     let mut pub_path = PathBuf::from("/var/lib/katagrapho/signing.pub");
+    let mut chain_dir = PathBuf::from("/var/lib/katagrapho");
 
     let mut i = 1;
     while i < args.len() {
@@ -73,6 +75,10 @@ fn main() {
             "--pub" if i + 1 < args.len() => {
                 i += 1;
                 pub_path = PathBuf::from(&args[i]);
+            }
+            "--chain-dir" if i + 1 < args.len() => {
+                i += 1;
+                chain_dir = PathBuf::from(&args[i]);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -114,8 +120,26 @@ fn main() {
     let mut pub_arr = [0u8; 32];
     pub_arr.copy_from_slice(&pub_bytes);
 
+    // Anchor chain verification to the persisted head so tail truncation (deletion
+    // of the newest manifests) is detectable. read_head returns GENESIS when no
+    // head.hash exists yet, which verify_recursive treats as "nothing to anchor".
+    let expected_head = if check_chain {
+        match chain::read_head(&chain::ChainPaths::under(&chain_dir)) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!(
+                    "katagrapho-verify: warning: cannot read chain head ({e}); \
+                     tail-truncation check skipped"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let result = if path.is_dir() {
-        match verify::verify_recursive(&path, &pub_arr, check_chain) {
+        match verify::verify_recursive(&path, &pub_arr, check_chain, expected_head.as_deref()) {
             Ok(r) => {
                 println!(
                     "katagrapho-verify: {} manifests verified{}",

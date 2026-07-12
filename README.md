@@ -12,7 +12,7 @@ Key properties:
 
 - **Streaming age encryption** via the `age` crate — data is encrypted as it arrives, never buffered in plaintext
 - **Encryption enforced by default** — refuses to run without `--recipient-file` (explicit `--no-encrypt` required for plaintext)
-- **Partial file preservation** — interrupted recordings are kept as evidence, not deleted
+- **Partial file preservation** — interrupted recordings are kept as evidence, not deleted. On a *catchable* stop (SIGTERM/SIGINT) the encrypted stream is finalized and stays decryptable; a *hard* kill (SIGKILL/OOM/power-loss) leaves only the in-progress part unfinalizable — earlier parts, bounded by size-based rotation, remain intact
 - **Termination markers** — writes an asciicinema `"x"` event on abnormal interruption
 - **Race-free file creation** via `openat()` with `O_CREAT|O_EXCL|O_NOFOLLOW`
 - **Username from kernel** — resolved from real UID via `getpwuid()`, not caller arguments
@@ -82,6 +82,22 @@ IPC is a stdin pipe. `epitropos` spawns `katagrapho` as a child process and pipe
 ```
 
 The recorded user owns nothing in this chain. Only `root` and members of `ssh-sessions` can read the recordings.
+
+## Verifying recordings
+
+Each recording gets a signed `.manifest.json` sidecar (ed25519), and every manifest is linked into a per-host append-only hash chain (`head.hash` / `head.hash.log`).
+
+```sh
+# Verify one sidecar: manifest signature AND that the recording file still
+# hashes to the signed value (detects on-disk tampering of the recording).
+katagrapho-verify /var/log/ssh-sessions/<user>/<id>.cast.age.manifest.json
+
+# Verify a whole tree and the chain, anchored to the persisted head.hash so
+# deletion of the newest recordings (tail truncation) is detected too.
+katagrapho-verify --check-chain --chain-dir /var/lib/katagrapho /var/log/ssh-sessions
+```
+
+Note: **integrity is availability-first.** If the signing key is unavailable, recording still proceeds but the session is written *without* a manifest — logged at `LOG_CRIT`, so wire that to alerting. keygen hard-fails if it cannot make the key readable by the recording user, so a missing manifest means genuine key misprovisioning, not a silent permission slip.
 
 ## Building from source
 

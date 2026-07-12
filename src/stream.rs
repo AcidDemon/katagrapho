@@ -84,16 +84,19 @@ impl<R: Read> Reader<R> {
 
     pub fn next_event(&mut self) -> Result<Option<(Event, Vec<u8>)>, KatagraphoError> {
         self.line_buf.clear();
-        let n = self
-            .inner
+        // Cap the reader at MAX_LINE_BYTES+1 before reading so a newline-less
+        // stream can't grow `line_buf` without limit. A length check after an
+        // unbounded `read_line` would already have buffered the whole line.
+        let n = (&mut self.inner)
+            .take(Self::MAX_LINE_BYTES as u64 + 1)
             .read_line(&mut self.line_buf)
             .map_err(|e| KatagraphoError::Stream(format!("read: {e}")))?;
         if n == 0 {
             return Ok(None);
         }
-        if n > Self::MAX_LINE_BYTES {
+        if self.line_buf.len() > Self::MAX_LINE_BYTES {
             return Err(KatagraphoError::Stream(format!(
-                "line too long ({n} bytes, max {})",
+                "line too long (> {} bytes)",
                 Self::MAX_LINE_BYTES
             )));
         }
@@ -195,5 +198,16 @@ mod tests {
     fn empty_stream_returns_none() {
         let mut reader = Reader::new(&[][..]);
         assert!(reader.next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_line_exceeding_cap_without_buffering_unbounded() {
+        // A newline-less stream longer than MAX_LINE_BYTES must be rejected.
+        // The bounded read caps memory at MAX_LINE_BYTES+1, so this does not OOM.
+        let oversized = vec![b'a'; Reader::<&[u8]>::MAX_LINE_BYTES + 2];
+        let mut reader = Reader::new(&oversized[..]);
+        let err = reader.next_event();
+        assert!(err.is_err(), "over-length line must be rejected");
+        assert!(format!("{}", err.err().unwrap()).contains("too long"));
     }
 }

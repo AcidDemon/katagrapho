@@ -41,21 +41,33 @@ fn main() {
     match signing::KeyPair::generate_to(&key_path, &pub_path) {
         Ok(kp) => {
             eprintln!("katagrapho-keygen: generated key_id={}", kp.key_id_hex());
-            // Chown to session-writer:ssh-sessions. Silent on failure —
-            // the systemd unit runs as root, so failing chown means
-            // the target user/group doesn't exist and the operator
-            // will see the ownership mismatch on the first recording.
-            unsafe {
+            // Chown to session-writer:ssh-sessions. This MUST succeed: the key is
+            // written 0400, so if it stays root-owned the recording process (running
+            // as session-writer) cannot read it and every recording is written
+            // WITHOUT integrity. Fail loudly rather than leave that silent hole.
+            let chown_ok = unsafe {
                 let user = CString::new("session-writer").unwrap();
                 let group = CString::new("ssh-sessions").unwrap();
                 let pw = libc::getpwnam(user.as_ptr());
                 let gr = libc::getgrnam(group.as_ptr());
-                if !pw.is_null() && !gr.is_null() {
+                if pw.is_null() || gr.is_null() {
+                    false
+                } else {
                     let key_c = CString::new(key_path.to_str().unwrap()).unwrap();
                     let pub_c = CString::new(pub_path.to_str().unwrap()).unwrap();
-                    libc::chown(key_c.as_ptr(), (*pw).pw_uid, (*gr).gr_gid);
-                    libc::chown(pub_c.as_ptr(), (*pw).pw_uid, (*gr).gr_gid);
+                    let r1 = libc::chown(key_c.as_ptr(), (*pw).pw_uid, (*gr).gr_gid);
+                    let r2 = libc::chown(pub_c.as_ptr(), (*pw).pw_uid, (*gr).gr_gid);
+                    r1 == 0 && r2 == 0
                 }
+            };
+            if !chown_ok {
+                eprintln!(
+                    "katagrapho-keygen: FAILED to chown {} to session-writer:ssh-sessions — \
+                     the key would be unreadable by the recording process and recordings \
+                     written WITHOUT integrity. Ensure the user and group exist, then re-run.",
+                    key_path.display()
+                );
+                exit(73); // EX_CANTCREAT
             }
             exit(0);
         }

@@ -136,7 +136,12 @@ in
     systemd.services.katagrapho-keygen = {
       description = "Generate katagrapho ed25519 signing key (first boot only)";
       wantedBy = [ "multi-user.target" ];
-      after = [ "local-fs.target" ];
+      # keygen hard-fails if it cannot chown the key to session-writer:ssh-sessions,
+      # so order it after user/group creation to avoid a spurious first-boot failure.
+      after = [
+        "local-fs.target"
+        "systemd-sysusers.service"
+      ];
       unitConfig = {
         ConditionPathExists = "!/var/lib/katagrapho/signing.key";
       };

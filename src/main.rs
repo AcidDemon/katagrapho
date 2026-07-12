@@ -547,6 +547,18 @@ fn run() -> Result<(), KatagraphoError> {
     } else {
         crate::kata_config::KataConfig::default()
     };
+
+    // RLIMIT_FSIZE was pinned to MAX_FILE_SIZE + slack before config load and
+    // cannot be raised after the privilege drop. A configured per-part cap above
+    // that would be enforced by SIGXFSZ mid-write — killing the process and
+    // leaving an un-finalized (undecryptable) part. Reject the misconfiguration.
+    if kata_cfg.storage.max_file_bytes > MAX_FILE_SIZE {
+        return Err(KatagraphoError::Config(format!(
+            "storage.max_file_bytes ({}) exceeds the {} MiB hard limit",
+            kata_cfg.storage.max_file_bytes,
+            MAX_FILE_SIZE / (1024 * 1024)
+        )));
+    }
     let signing_key =
         crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
     let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
@@ -634,6 +646,13 @@ fn run() -> Result<(), KatagraphoError> {
         total_chunks += outcome.chunks.len();
 
         // Write signed manifest + advance chain.
+        //
+        // Availability-first policy: if the signing key is unavailable, the recording
+        // is still written but WITHOUT a manifest/chain entry, and the failure is
+        // logged at LOG_CRIT for alerting — losing the recording is worse than losing
+        // the integrity proof for a session recorder. keygen hard-fails its chown, so
+        // an unreadable key cannot be a silent cause; a missing key here means genuine
+        // misprovisioning. For fail-closed instead, abort in the `Err(_)` arm below.
         let mut part_manifest_hash: Option<String> = None;
         if let Ok(ref key) = signing_key {
             match write_manifest_and_advance(
