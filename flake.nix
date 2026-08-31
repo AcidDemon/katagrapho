@@ -93,20 +93,33 @@
         system:
         let
           pkgs = pkgsFor system;
-          rustToolchain = rustToolchainFor pkgs;
+          # minimal lacks rustfmt/clippy, which the fmt and clippy checks need.
+          rustToolchain = (rustToolchainFor pkgs).override {
+            extensions = [
+              "rustfmt"
+              "clippy"
+            ];
+          };
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
           src = craneLib.cleanCargoSource ./.;
-        in
-        {
-          package = self.packages.${system}.default;
-
-          clippy = craneLib.cargoClippy {
+          checkArgs = {
             inherit src;
             pname = "katagrapho";
             version = "0.3.0";
             strictDeps = true;
-            cargoClippyExtraArgs = "-- --deny warnings";
           };
+          checkArtifacts = craneLib.buildDepsOnly checkArgs;
+        in
+        {
+          package = self.packages.${system}.default;
+
+          clippy = craneLib.cargoClippy (
+            checkArgs
+            // {
+              cargoArtifacts = checkArtifacts;
+              cargoClippyExtraArgs = "-- --deny warnings";
+            }
+          );
 
           fmt = craneLib.cargoFmt {
             inherit src;
@@ -114,12 +127,7 @@
             version = "0.3.0";
           };
 
-          tests = craneLib.cargoTest {
-            inherit src;
-            pname = "katagrapho";
-            version = "0.3.0";
-            strictDeps = true;
-          };
+          tests = craneLib.cargoTest (checkArgs // { cargoArtifacts = checkArtifacts; });
         }
       );
 
