@@ -142,6 +142,9 @@ in
         "local-fs.target"
         "systemd-sysusers.service"
       ];
+      # wantedBy alone does not make multi-user.target wait for a oneshot, so
+      # anything that reads the key right after the target is reached races it.
+      before = [ "multi-user.target" ];
       unitConfig = {
         ConditionPathExists = "!/var/lib/katagrapho/signing.key";
       };
