@@ -43,13 +43,13 @@ in
 
     group = mkOption {
       type = types.str;
-      default = "ssh-sessions";
-      description = "Group that owns session recordings.";
+      default = "katagrapho";
+      description = "Group that owns session recordings and the signing key.";
     };
 
     user = mkOption {
       type = types.str;
-      default = "session-writer";
+      default = "katagrapho";
       description = "Dedicated user that owns session recording files.";
     };
 
@@ -183,7 +183,7 @@ in
       };
       serviceConfig = {
         Type = "oneshot";
-        ExecStart = "${cfg.package}/bin/katagrapho-keygen";
+        ExecStart = "${cfg.package}/bin/katagrapho-keygen --user ${cfg.user} --group ${cfg.group}";
         User = "root";
         RemainAfterExit = true;
       };
