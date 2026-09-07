@@ -1053,6 +1053,13 @@ fn main() {
     match run() {
         Ok(()) => {}
         Err(e) => {
+            // stderr is closed when the proxy spawns us, so a fatal error must
+            // also reach syslog or it is invisible: the proxy can only report
+            // "writer exited unexpectedly". syslog(3) works even for failures
+            // before open_syslog runs (re-opening is harmless and keeps the
+            // "katagrapho" ident for journalctl -t).
+            open_syslog();
+            syslog_msg(libc::LOG_ERR, &format!("fatal: {e}"));
             eprintln!("katagrapho: {e}");
             close_syslog();
             process::exit(e.exit_code());
