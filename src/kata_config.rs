@@ -22,6 +22,18 @@ pub struct KataConfig {
     pub signing: Signing,
     #[serde(default)]
     pub chain: Chain,
+    #[serde(default)]
+    pub encryption: Encryption,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub struct Encryption {
+    /// Directory containing age-plugin-* binaries, prepended to PATH before
+    /// recipient loading so plugin recipients (age1yubikey1…) can be used.
+    #[serde(default)]
+    pub plugin_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +143,22 @@ max_session_bytes = 8192
         let cfg: KataConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.storage.max_file_bytes, 1024);
         assert_eq!(cfg.storage.max_session_bytes, 8192);
+    }
+
+    #[test]
+    fn parses_plugin_path() {
+        let cfg: KataConfig =
+            toml::from_str("[encryption]\nplugin_path = \"/some/dir\"").unwrap();
+        assert_eq!(cfg.encryption.plugin_path, Some(PathBuf::from("/some/dir")));
+    }
+
+    #[test]
+    fn plugin_path_defaults_to_none() {
+        let cfg: KataConfig = toml::from_str("[encryption]").unwrap();
+        assert_eq!(cfg.encryption.plugin_path, None);
+        // Empty config also yields None.
+        let empty: KataConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.encryption.plugin_path, None);
     }
 
     #[test]

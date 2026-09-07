@@ -16,6 +16,19 @@ let
     types
     literalExpression
     ;
+
+  # age plugin binaries (e.g. age-plugin-yubikey) collected into one bin dir.
+  # katagrapho sanitizes its environment at startup, so it re-establishes PATH
+  # from this trusted directory before loading recipients — that is how plugin
+  # recipients (age1yubikey1…) resolve their plugin binary at encrypt time.
+  pluginEnv = pkgs.symlinkJoin {
+    name = "katagrapho-age-plugins";
+    paths = cfg.encryption.plugins;
+  };
+  needConfig = cfg.encryption.plugins != [ ];
+  configFile = (pkgs.formats.toml { }).generate "katagrapho-config.toml" {
+    encryption.plugin_path = "${pluginEnv}/bin";
+  };
 in
 {
   options.services.katagrapho = {
@@ -66,6 +79,18 @@ in
           recordings are allowed.
         '';
       };
+
+      plugins = mkOption {
+        type = types.listOf types.package;
+        default = [ ];
+        example = literalExpression "[ pkgs.age-plugin-yubikey ]";
+        description = ''
+          age plugin packages required to encrypt to plugin recipients such
+          as age1yubikey1…. Their bin directory is written to katagrapho's
+          config and prepended to PATH at encrypt time. Native age1… X25519
+          recipients need nothing here.
+        '';
+      };
     };
 
     logRotation = {
@@ -101,6 +126,14 @@ in
         '';
       }
     ];
+
+    # katagrapho reads /etc/katagrapho/config.toml if present. Only write it
+    # when there is something to carry (plugin path); otherwise keep the
+    # binary's built-in defaults, as before.
+    environment.etc."katagrapho/config.toml" = mkIf needConfig {
+      source = configFile;
+      mode = "0444";
+    };
 
     users.groups.${cfg.group} = {
       members = lib.optional

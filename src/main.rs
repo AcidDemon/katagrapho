@@ -274,20 +274,49 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, Ka
         KatagraphoError::Recipient(format!("cannot read recipient file '{path}': {e}"))
     })?;
 
-    let recipients: Vec<Box<dyn age::Recipient + Send>> = contents
-        .lines()
-        .filter(|l| {
-            let trimmed = l.trim();
-            !trimmed.is_empty() && !trimmed.starts_with('#')
-        })
-        .map(|l| {
-            l.parse::<age::x25519::Recipient>()
-                .map(|r| Box::new(r) as Box<dyn age::Recipient + Send>)
-                .map_err(|_| {
-                    KatagraphoError::Recipient("invalid age recipient in file".to_string())
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut recipients: Vec<Box<dyn age::Recipient + Send>> = Vec::new();
+    // Plugin recipients (e.g. age1yubikey1…) are grouped by plugin name; a
+    // single RecipientPluginV1 handles all recipients for one plugin binary.
+    let mut plugin_recipients: Vec<age::plugin::Recipient> = Vec::new();
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Ok(r) = trimmed.parse::<age::x25519::Recipient>() {
+            recipients.push(Box::new(r) as Box<dyn age::Recipient + Send>);
+        } else if let Ok(r) = trimmed.parse::<age::plugin::Recipient>() {
+            plugin_recipients.push(r);
+        } else {
+            return Err(KatagraphoError::Recipient(
+                "invalid age recipient in file".to_string(),
+            ));
+        }
+    }
+
+    // Build one plugin per distinct plugin name. RecipientPluginV1::new spawns
+    // the age-plugin-<name> binary (found via the PATH we restored from config),
+    // filters the passed recipients down to that plugin, and implements
+    // age::Recipient. NoCallbacks is non-interactive: encrypting to a plugin
+    // recipient never prompts, so every callback returns None.
+    let mut seen_plugins: Vec<&str> = Vec::new();
+    for r in &plugin_recipients {
+        if seen_plugins.contains(&r.plugin()) {
+            continue;
+        }
+        seen_plugins.push(r.plugin());
+        let plugin = age::plugin::RecipientPluginV1::new(
+            r.plugin(),
+            &plugin_recipients,
+            &[],
+            age::NoCallbacks,
+        )
+        .map_err(|e| {
+            KatagraphoError::Recipient(format!("age plugin '{}': {e}", r.plugin()))
+        })?;
+        recipients.push(Box::new(plugin) as Box<dyn age::Recipient + Send>);
+    }
 
     if recipients.is_empty() {
         return Err(KatagraphoError::Recipient(format!(
@@ -568,6 +597,16 @@ fn run() -> Result<(), KatagraphoError> {
             MAX_FILE_SIZE / (1024 * 1024)
         )));
     }
+    // sanitize_environment() wiped PATH, but age's plugin machinery shells out
+    // to age-plugin-<name> and looks it up on PATH. Restore PATH from the
+    // trusted config value (never from inherited env) so plugin recipients like
+    // age1yubikey1… can be used for encryption.
+    if let Some(dir) = &kata_cfg.encryption.plugin_path {
+        // SAFETY: single-threaded here (before the per-part loop); dir comes
+        // from the root-owned config file, not attacker-controlled env.
+        unsafe { std::env::set_var("PATH", dir) };
+    }
+
     let signing_key =
         crate::signing::KeyPair::load(&kata_cfg.signing.key_path, &kata_cfg.signing.pub_path);
     let chain_paths = crate::chain::ChainPaths::under(&kata_cfg.chain.dir);
@@ -1164,5 +1203,46 @@ mod tests {
         sanitize_environment();
         assert!(std::env::var("LD_PRELOAD").is_err());
         assert!(std::env::var("PATH").is_err());
+    }
+
+    const TEST_YUBIKEY: &str =
+        "age1yubikey1qtkly5zgk75f7fnwkvru2pcaxps2s6z9pxj4r2lygsr3cnm0wfazzr3rvvu";
+
+    fn write_recipients(contents: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn x25519_recipient_loads_and_builds_encryptor() {
+        let pubkey = age::x25519::Identity::generate().to_public().to_string();
+        let f = write_recipients(&format!("# comment\n{pubkey}\n"));
+        let recipients = load_recipients(f.path().to_str().unwrap()).unwrap();
+        assert_eq!(recipients.len(), 1);
+        let refs: Vec<&dyn age::Recipient> =
+            recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient).collect();
+        assert!(age::Encryptor::with_recipients(refs.into_iter()).is_ok());
+    }
+
+    #[test]
+    fn yubikey_recipient_parses_with_plugin_name() {
+        // Parsing a plugin recipient needs no binary; only encryption would.
+        let r = TEST_YUBIKEY.parse::<age::plugin::Recipient>().unwrap();
+        assert_eq!(r.plugin(), "yubikey");
+    }
+
+    #[test]
+    fn garbage_recipient_is_rejected() {
+        let f = write_recipients("not-a-recipient\n");
+        assert!(load_recipients(f.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn empty_recipient_file_is_rejected() {
+        let f = write_recipients("# only comments\n\n");
+        assert!(load_recipients(f.path().to_str().unwrap()).is_err());
     }
 }
