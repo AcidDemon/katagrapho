@@ -333,6 +333,22 @@ struct Args {
     no_encrypt: bool,
 }
 
+/// Whether a recipient-file path is one the deployment is allowed to point at.
+///
+/// Checks the CONFIGURED path lexically and does NOT canonicalize: on NixOS
+/// every /etc file is a symlink into the immutable /nix/store, so canonicalize
+/// would resolve /etc/epitropos/recipients out to a store path and reject a
+/// valid deployment. The path comes from root-owned config, not from the
+/// recorded user, so "root pointed us under an allowed /etc dir" is the
+/// property we need. `..` is rejected so the prefix cannot be escaped.
+fn recipient_path_allowed(path: &Path) -> bool {
+    let allowed_dirs = ["/etc/katagrapho", "/etc/age", "/etc/epitropos"];
+    let has_parent_ref = path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir);
+    !has_parent_ref && allowed_dirs.iter().any(|d| path.starts_with(d))
+}
+
 fn parse_args() -> Result<Args, KatagraphoError> {
     let args: Vec<String> = std::env::args().collect();
     let mut session_id = None;
@@ -458,19 +474,12 @@ fn run() -> Result<(), KatagraphoError> {
         ));
     }
 
-    if let Some(ref rf) = args.recipient_file {
-        let rf_path = Path::new(rf);
-        let resolved = fs::canonicalize(rf_path).map_err(|e| {
-            KatagraphoError::Recipient(format!("cannot resolve recipient file '{rf}': {e}"))
-        })?;
-        let allowed_dirs = ["/etc/katagrapho", "/etc/age", "/etc/epitropos"];
-        let in_allowed_dir = allowed_dirs.iter().any(|d| resolved.starts_with(d));
-        if !in_allowed_dir {
-            return Err(KatagraphoError::Recipient(format!(
-                "recipient file must be in /etc/katagrapho/, /etc/age/, or /etc/epitropos/ (got '{}')",
-                resolved.display()
-            )));
-        }
+    if let Some(ref rf) = args.recipient_file
+        && !recipient_path_allowed(Path::new(rf))
+    {
+        return Err(KatagraphoError::Recipient(format!(
+            "recipient file must be in /etc/katagrapho/, /etc/age/, or /etc/epitropos/ (got '{rf}')"
+        )));
     }
 
     let username = resolve_caller_username()?;
@@ -1121,6 +1130,29 @@ mod tests {
         symlink("/tmp", &link).unwrap();
         let result = validate_directory(&link);
         assert!(result.is_err(), "symlink to /tmp should be rejected");
+    }
+
+    #[test]
+    fn recipient_path_allowlist() {
+        // Allowed dirs, including a symlink-into-store style path that
+        // canonicalize would have rejected.
+        assert!(recipient_path_allowed(Path::new(
+            "/etc/epitropos/recording-recipients"
+        )));
+        assert!(recipient_path_allowed(Path::new("/etc/age/recipients.txt")));
+        assert!(recipient_path_allowed(Path::new(
+            "/etc/katagrapho/recipients"
+        )));
+        // Outside the allowlist.
+        assert!(!recipient_path_allowed(Path::new(
+            "/nix/store/abc-recipients"
+        )));
+        assert!(!recipient_path_allowed(Path::new("/tmp/evil")));
+        assert!(!recipient_path_allowed(Path::new("/etc/passwd")));
+        // Traversal cannot escape an allowed prefix.
+        assert!(!recipient_path_allowed(Path::new(
+            "/etc/epitropos/../../tmp/evil"
+        )));
     }
 
     #[test]
