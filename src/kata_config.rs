@@ -12,6 +12,14 @@ const DEFAULT_KEY_PATH: &str = "/var/lib/katagrapho/signing.key";
 const DEFAULT_PUB_PATH: &str = "/var/lib/katagrapho/signing.pub";
 const DEFAULT_CHAIN_DIR: &str = "/var/lib/katagrapho";
 
+/// Where the config lives. Overridable at COMPILE time only, like
+/// STORAGE_DIR, so a deployed binary still reads exactly one root-owned path
+/// and cannot be pointed elsewhere by a caller. Tests build with it set.
+pub const CONFIG_PATH: &str = match option_env!("KATAGRAPHO_CONFIG_PATH") {
+    Some(p) => p,
+    None => "/etc/katagrapho/config.toml",
+};
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
@@ -147,8 +155,7 @@ max_session_bytes = 8192
 
     #[test]
     fn parses_plugin_path() {
-        let cfg: KataConfig =
-            toml::from_str("[encryption]\nplugin_path = \"/some/dir\"").unwrap();
+        let cfg: KataConfig = toml::from_str("[encryption]\nplugin_path = \"/some/dir\"").unwrap();
         assert_eq!(cfg.encryption.plugin_path, Some(PathBuf::from("/some/dir")));
     }
 

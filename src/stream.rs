@@ -34,6 +34,11 @@ pub enum Event {
         reason: String,
         exit_code: i32,
     },
+    /// A record kind this build does not know. Stored verbatim and otherwise
+    /// ignored, so a newer epitropos cannot abort recording.
+    Unknown {
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -149,11 +154,15 @@ impl<R: Read> Reader<R> {
                 reason: v["reason"].as_str().unwrap_or("eof").to_string(),
                 exit_code: v["exit_code"].as_i64().unwrap_or(0) as i32,
             },
-            other => {
-                return Err(KatagraphoError::Stream(format!(
-                    "unknown record kind: {other}"
-                )));
-            }
+            // Forward compatibility, not laxity. The caller has already
+            // written the raw line into the encrypted output by the time it
+            // looks at the event, so failing here aborted a session over a
+            // record that is already stored verbatim. epitropos and katagrapho
+            // are deployed as a pair, but a fleet still updates one host at a
+            // time, and a proxy one version ahead must not kill every login.
+            other => Event::Unknown {
+                kind: other.to_string(),
+            },
         };
         Ok(Some((event, raw_bytes)))
     }
@@ -188,9 +197,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_kind() {
-        let input = "{\"kind\":\"weird\"}\n";
+    fn passes_through_unknown_kind_with_raw_bytes_intact() {
+        // A newer epitropos emitting a record this build does not know must
+        // not end the session. The raw line still has to reach the caller
+        // verbatim, because that is what gets written to the recording.
+        let input = "{\"kind\":\"weird\",\"t\":1.0}\n";
         let mut reader = Reader::new(input.as_bytes());
+        let (event, raw) = reader.next_event().unwrap().unwrap();
+        match event {
+            Event::Unknown { kind } => assert_eq!(kind, "weird"),
+            other => panic!("expected Event::Unknown, got {other:?}"),
+        }
+        assert_eq!(raw, input.as_bytes());
+        assert!(reader.next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn still_rejects_a_record_with_no_kind() {
+        // Forward compatibility covers unknown kinds, not malformed records.
+        let mut reader = Reader::new(&b"{\"t\":1.0}\n"[..]);
         assert!(reader.next_event().is_err());
     }
 

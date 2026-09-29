@@ -1,11 +1,13 @@
 // katagrapho — Setuid+setgid binary for tamper-proof session recording.
 //
-// Reads asciicinema data from stdin, optionally encrypts with age, and writes
-// to /var/log/ssh-sessions/<user>/<session-id><suffix>.
+// Reads the katagrapho-v1 record stream from stdin, optionally encrypts with
+// age, and writes to /var/log/ssh-sessions/<user>/<session-id>.part<N><suffix>.
 //
-// The binary runs setuid as a dedicated "session-writer" user and setgid as
-// "ssh-sessions". Files are therefore owned by session-writer:ssh-sessions
-// with mode 0440 — the recorded user cannot modify or delete them.
+// The binary runs setuid as a dedicated "katagrapho" user and setgid as the
+// "katagrapho" group; the setgid bit on the storage directory gives new files
+// the "katagrapho-readers" group instead. Recordings are mode 0440 in a
+// directory the recorded user does not own, so they cannot modify or delete
+// them.
 
 mod chain;
 mod error;
@@ -24,6 +26,8 @@ use std::os::unix::fs::DirBuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// One warning per process for record kinds this build does not know.
+static UNKNOWN_KIND_LOGGED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -39,7 +43,10 @@ const STORAGE_DIR: &str = match option_env!("KATAGRAPHO_STORAGE_DIR") {
 const MAX_SESSION_ID: usize = 128;
 const MAX_USERNAME: usize = 64;
 const MAX_SUFFIX: usize = 32;
-const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB per session
+const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB per part
+/// Floor for a configured per-part cap. Below this the recorder rotates on
+/// nearly every record instead of recording.
+const MIN_PART_BYTES: u64 = 1024 * 1024;
 
 const SAFE_ID_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-";
 const SAFE_SUFFIX_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.";
@@ -83,6 +90,20 @@ fn syslog_msg(priority: libc::c_int, msg: &str) {
     unsafe { libc::syslog(priority, fmt.as_ptr(), c_msg.as_ptr()) };
 }
 
+/// Warn once per process about a record kind this build does not know. Once,
+/// not once per record: a newer proxy can emit thousands of them.
+fn warn_unknown_kind_once(kind: &str) {
+    if UNKNOWN_KIND_LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    syslog_msg(
+        libc::LOG_WARNING,
+        &format!(
+            "unknown record kind '{kind}' stored verbatim; epitropos may be newer than katagrapho"
+        ),
+    );
+}
+
 /// Set a restrictive umask before any filesystem operations.
 fn set_umask() {
     unsafe {
@@ -109,41 +130,61 @@ fn close_inherited_fds() {
     }
 }
 
-/// Reset resource limits to prevent caller manipulation.
-fn reset_resource_limits() -> Result<(), KatagraphoError> {
-    let zero = libc::rlimit {
+/// Pin a limit at `desired`, never above the hard limit we inherited.
+///
+/// The process is setuid to an unprivileged account, so it cannot raise a hard
+/// limit: asking for more than the caller passed down fails with EPERM. Doing
+/// that unconditionally meant a caller with, say, a 16 MiB RLIMIT_FSIZE made
+/// katagrapho refuse to start, which on a fail-closed host locks every recorded
+/// user out. Clamping records as much as the limit allows instead.
+fn clamp_rlimit(
+    resource: libc::__rlimit_resource_t,
+    desired: u64,
+    label: &str,
+) -> Result<u64, KatagraphoError> {
+    let mut current = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
+    if unsafe { libc::getrlimit(resource, &mut current) } != 0 {
         return Err(KatagraphoError::Privilege(format!(
-            "cannot reset RLIMIT_CORE: {}",
+            "cannot read {label}: {}",
             io::Error::last_os_error()
         )));
     }
-
-    let fsize = libc::rlimit {
-        rlim_cur: MAX_FILE_SIZE + 1024 * 1024,
-        rlim_max: MAX_FILE_SIZE + 1024 * 1024,
+    let value = desired.min(current.rlim_max);
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
     };
-    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &fsize) } != 0 {
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
         return Err(KatagraphoError::Privilege(format!(
-            "cannot reset RLIMIT_FSIZE: {}",
+            "cannot reset {label}: {}",
             io::Error::last_os_error()
         )));
     }
+    Ok(value)
+}
 
-    let nofile = libc::rlimit {
-        rlim_cur: 64,
-        rlim_max: 64,
-    };
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
-        return Err(KatagraphoError::Privilege(format!(
-            "cannot reset RLIMIT_NOFILE: {}",
-            io::Error::last_os_error()
-        )));
+/// Reset resource limits to prevent caller manipulation.
+fn reset_resource_limits() -> Result<(), KatagraphoError> {
+    // Lowering is always permitted, and a core dump of this process would
+    // contain the signing key.
+    clamp_rlimit(libc::RLIMIT_CORE, 0, "RLIMIT_CORE")?;
+
+    let want_fsize = MAX_FILE_SIZE + 1024 * 1024;
+    let fsize = clamp_rlimit(libc::RLIMIT_FSIZE, want_fsize, "RLIMIT_FSIZE")?;
+    if fsize < want_fsize {
+        syslog_msg(
+            libc::LOG_WARNING,
+            &format!(
+                "inherited RLIMIT_FSIZE hard limit is {fsize} bytes, below the {want_fsize} \
+                 katagrapho wants; parts will be capped by the inherited limit"
+            ),
+        );
     }
 
+    clamp_rlimit(libc::RLIMIT_NOFILE, 64, "RLIMIT_NOFILE")?;
     Ok(())
 }
 
@@ -242,9 +283,17 @@ fn validate_directory(path: &Path) -> Result<(), KatagraphoError> {
         KatagraphoError::Storage(format!("cannot resolve '{}': {e}", path.display()))
     })?;
 
+    // Compare against the RESOLVED root, not the literal STORAGE_DIR string.
+    // With a symlinked ancestor (/var/log -> /mnt/log, a normal layout on a
+    // host with a separate log volume) the resolved path starts with /mnt/log
+    // and a literal comparison rejects every recording on the host.
+    let root = fs::canonicalize(STORAGE_DIR).map_err(|e| {
+        KatagraphoError::Storage(format!("cannot resolve storage dir '{STORAGE_DIR}': {e}"))
+    })?;
+
     // Path::starts_with checks component boundaries, so
     // "/var/log/ssh-sessions-evil" will NOT match "/var/log/ssh-sessions".
-    if !resolved.starts_with(STORAGE_DIR) {
+    if !resolved.starts_with(&root) {
         return Err(KatagraphoError::Storage(
             "path resolves outside storage directory".to_string(),
         ));
@@ -258,6 +307,26 @@ fn validate_directory(path: &Path) -> Result<(), KatagraphoError> {
         return Err(KatagraphoError::Storage(format!(
             "'{}' is not a directory",
             path.display()
+        )));
+    }
+
+    // A per-user directory that already exists is reused as-is, so check that
+    // it is ours and not writable by anyone outside the recording group before
+    // writing evidence into it.
+    use std::os::unix::fs::MetadataExt;
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(KatagraphoError::Storage(format!(
+            "'{}' is owned by uid {}, not the recorder (uid {euid})",
+            path.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o007 != 0 {
+        return Err(KatagraphoError::Storage(format!(
+            "'{}' is accessible to other (mode {:o})",
+            path.display(),
+            meta.mode() & 0o7777
         )));
     }
     Ok(())
@@ -312,9 +381,7 @@ fn load_recipients(path: &str) -> Result<Vec<Box<dyn age::Recipient + Send>>, Ka
             &[],
             age::NoCallbacks,
         )
-        .map_err(|e| {
-            KatagraphoError::Recipient(format!("age plugin '{}': {e}", r.plugin()))
-        })?;
+        .map_err(|e| KatagraphoError::Recipient(format!("age plugin '{}': {e}", r.plugin())))?;
         recipients.push(Box::new(plugin) as Box<dyn age::Recipient + Send>);
     }
 
@@ -477,6 +544,15 @@ fn install_signal_handlers() {
         if libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut()) != 0 {
             process::abort();
         }
+
+        // SIGXFSZ default disposition is terminate, which would kill the
+        // process mid-write with the age stream unfinalized — exactly the
+        // undecryptable part the size caps exist to avoid. Ignored, the write
+        // returns EFBIG instead, the error propagates, and the finalizer's Drop
+        // still closes the stream so the recording stays decryptable.
+        if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+            process::abort();
+        }
     }
 }
 
@@ -484,9 +560,11 @@ fn run() -> Result<(), KatagraphoError> {
     sanitize_environment();
     set_umask();
     close_inherited_fds();
+    // Syslog before the limits, so a clamped limit has somewhere to be
+    // reported. close_inherited_fds has already run, so its fd survives.
+    open_syslog();
     reset_resource_limits()?;
     harden_process()?;
-    open_syslog();
     install_signal_handlers();
 
     let args = parse_args()?;
@@ -579,7 +657,7 @@ fn run() -> Result<(), KatagraphoError> {
     }
 
     // Load signing key + chain paths + storage limits from config.
-    let config_path = std::path::Path::new("/etc/katagrapho/config.toml");
+    let config_path = std::path::Path::new(crate::kata_config::CONFIG_PATH);
     let kata_cfg = if config_path.exists() {
         crate::kata_config::KataConfig::load(config_path)?
     } else {
@@ -597,11 +675,45 @@ fn run() -> Result<(), KatagraphoError> {
             MAX_FILE_SIZE / (1024 * 1024)
         )));
     }
+    // A floor as well as a ceiling. At 0 the cap trips on the first record of
+    // every part, so the recorder spends the session creating, fsyncing,
+    // signing and chaining empty parts instead of recording.
+    if kata_cfg.storage.max_file_bytes < MIN_PART_BYTES {
+        return Err(KatagraphoError::Config(format!(
+            "storage.max_file_bytes ({}) is below the {} MiB minimum",
+            kata_cfg.storage.max_file_bytes,
+            MIN_PART_BYTES / (1024 * 1024)
+        )));
+    }
+    if kata_cfg.storage.max_session_bytes < kata_cfg.storage.max_file_bytes {
+        return Err(KatagraphoError::Config(format!(
+            "storage.max_session_bytes ({}) is below storage.max_file_bytes ({})",
+            kata_cfg.storage.max_session_bytes, kata_cfg.storage.max_file_bytes
+        )));
+    }
     // sanitize_environment() wiped PATH, but age's plugin machinery shells out
     // to age-plugin-<name> and looks it up on PATH. Restore PATH from the
     // trusted config value (never from inherited env) so plugin recipients like
     // age1yubikey1… can be used for encryption.
     if let Some(dir) = &kata_cfg.encryption.plugin_path {
+        // This value becomes the entire PATH of a setuid process, so check it
+        // before trusting it: a relative entry would resolve against a cwd
+        // this process never sets, and an embedded NUL would make set_var
+        // panic, which under panic = "abort" is a SIGABRT rather than an
+        // error an operator can read.
+        use std::os::unix::ffi::OsStrExt;
+        if !dir.is_absolute() || dir.as_os_str().as_bytes().contains(&0) {
+            return Err(KatagraphoError::Config(format!(
+                "encryption.plugin_path must be an absolute path without NUL (got '{}')",
+                dir.display()
+            )));
+        }
+        if !dir.is_dir() {
+            return Err(KatagraphoError::Config(format!(
+                "encryption.plugin_path '{}' is not a directory",
+                dir.display()
+            )));
+        }
         // SAFETY: single-threaded here (before the per-part loop); dir comes
         // from the root-owned config file, not attacker-controlled env.
         unsafe { std::env::set_var("PATH", dir) };
@@ -762,6 +874,21 @@ fn run() -> Result<(), KatagraphoError> {
             total_chunks,
         ),
     );
+
+    // A finalize that failed inside Drop could not be returned from there. It
+    // means a part is truncated mid-chunk and probably will not decrypt, even
+    // though it has a valid signed manifest, so it has to be as loud as a
+    // missing key.
+    if crate::finalize::FINALIZE_FAILED.load(Ordering::SeqCst) {
+        syslog_msg(
+            libc::LOG_CRIT,
+            &format!(
+                "encrypted stream finalize FAILED for session_id={} user={username} — at least \
+                 one part is incomplete and may not decrypt",
+                args.session_id
+            ),
+        );
+    }
     close_syslog();
 
     if hit_session_limit {
@@ -920,10 +1047,6 @@ fn run_part_loop<R: std::io::BufRead + std::io::Read, W: Write>(
     }
 
     while let Some((event, raw)) = reader.next_event()? {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            *end_reason = "signal".to_string();
-            break;
-        }
         writer.write_all(&raw).map_err(KatagraphoError::Io)?;
         *part_bytes += raw.len() as u64;
         *session_bytes += raw.len() as u64;
@@ -943,16 +1066,6 @@ fn run_part_loop<R: std::io::BufRead + std::io::Read, W: Write>(
                     elapsed: c.elapsed,
                     sha256: c.sha256_hex,
                 });
-                if *session_bytes >= max_session_bytes {
-                    *end_reason = "session_size_limit".to_string();
-                    *next = PartNext::SessionSizeLimit;
-                    break;
-                }
-                if *part_bytes >= max_file_bytes {
-                    *end_reason = "rotated".to_string();
-                    *next = PartNext::Rotated;
-                    break;
-                }
             }
             Event::End {
                 reason,
@@ -963,7 +1076,34 @@ fn run_part_loop<R: std::io::BufRead + std::io::Read, W: Write>(
                 *exit_code = ec;
                 break;
             }
+            // Kept verbatim in the output, but the operator should know the
+            // proxy is emitting records this build cannot account for.
+            Event::Unknown { kind } => warn_unknown_kind_once(&kind),
             _ => {}
+        }
+
+        // Checked after the record has been written, not before. Breaking on
+        // the flag first threw away the record that was already read off
+        // stdin, so a SIGTERM lost the last thing the user did and the signed
+        // manifest described a session missing its final moments.
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            *end_reason = "signal".to_string();
+            break;
+        }
+
+        // Checked after every record, not only on `chunk`: out/in/resize carry
+        // essentially all of the volume, so sampling the counters at the
+        // caller's chunk cadence let a part overshoot by the whole inter-chunk
+        // gap. Overshoot past RLIMIT_FSIZE is what the cap exists to prevent.
+        if *session_bytes >= max_session_bytes {
+            *end_reason = "session_size_limit".to_string();
+            *next = PartNext::SessionSizeLimit;
+            break;
+        }
+        if *part_bytes >= max_file_bytes {
+            *end_reason = "rotated".to_string();
+            *next = PartNext::Rotated;
+            break;
         }
     }
     Ok(())
@@ -1040,6 +1180,7 @@ fn write_manifest_and_advance(
         session_id,
         part,
         &manifest.this_manifest_hash,
+        key,
     )?;
 
     Ok(manifest.this_manifest_hash)
@@ -1222,8 +1363,10 @@ mod tests {
         let f = write_recipients(&format!("# comment\n{pubkey}\n"));
         let recipients = load_recipients(f.path().to_str().unwrap()).unwrap();
         assert_eq!(recipients.len(), 1);
-        let refs: Vec<&dyn age::Recipient> =
-            recipients.iter().map(|r| r.as_ref() as &dyn age::Recipient).collect();
+        let refs: Vec<&dyn age::Recipient> = recipients
+            .iter()
+            .map(|r| r.as_ref() as &dyn age::Recipient)
+            .collect();
         assert!(age::Encryptor::with_recipients(refs.into_iter()).is_ok());
     }
 

@@ -4,10 +4,20 @@
 //! so a SIGTERM mid-stream left an unfinalized (undecryptable) age blob.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set when a `finish()` running from `Drop` failed, which leaves the part on
+/// disk truncated mid-chunk and very likely undecryptable.
+///
+/// `Drop` has no way to return an error and this crate builds with
+/// `panic = "abort"`, so the failure used to vanish entirely: the recording
+/// looked complete, carried a signed manifest, and would not decrypt. The
+/// caller checks this flag and logs it at LOG_CRIT.
+pub static FINALIZE_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Wraps an age stream writer and guarantees `finish()` runs once, on
-/// drop or explicit `finish()`. The result of `finish()` from drop is
-/// swallowed; callers who care must call the explicit `finish()`.
+/// drop or explicit `finish()`. A `finish()` that fails during drop cannot be
+/// returned, so it sets `FINALIZE_FAILED` instead of being swallowed.
 pub struct EncryptionFinalizer<W: Write> {
     inner: Option<age::stream::StreamWriter<W>>,
 }
@@ -49,9 +59,14 @@ impl<W: Write> Write for EncryptionFinalizer<W> {
 
 impl<W: Write> Drop for EncryptionFinalizer<W> {
     fn drop(&mut self) {
-        if let Some(w) = self.inner.take() {
-            // Best effort: swallow result. Callers who care call finish() explicitly.
-            let _ = w.finish();
+        if let Some(w) = self.inner.take()
+            && let Err(e) = w.finish()
+        {
+            // Drop cannot return, so record it for the caller and put the
+            // reason on stderr, which the proxy captures. A part whose
+            // finalize failed is incomplete on disk.
+            FINALIZE_FAILED.store(true, Ordering::SeqCst);
+            eprintln!("katagrapho: finalizing the encrypted stream failed: {e}");
         }
     }
 }
