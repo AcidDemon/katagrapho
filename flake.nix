@@ -37,6 +37,14 @@
       # edition = "2024" requires Rust >= 1.85.
       rustToolchainFor = pkgs: pkgs.rust-bin.stable.latest.minimal;
 
+      # One source of truth; it used to be spelled out in three places and had
+      # already drifted from the tree.
+      version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
+
+      # cleanCargoSource strips .git, so build.rs cannot find the revision.
+      # Hand it in, or every signed manifest claims commit "unknown".
+      gitCommit = self.shortRev or self.dirtyShortRev or "unknown";
+
       mkKatagrapho =
         pkgs:
         let
@@ -45,19 +53,19 @@
           src = craneLib.cleanCargoSource ./.;
 
           commonArgs = {
-            inherit src;
+            inherit src version;
             pname = "katagrapho";
-            version = "0.3.0";
             strictDeps = true;
+            KATAGRAPHO_GIT_COMMIT = gitCommit;
 
-            # Security hardening via linker flags.
-            RUSTFLAGS = builtins.concatStringsSep " " [
-              "-C link-arg=-Wl,-z,relro,-z,now"
-              "-C panic=abort"
-            ];
+            # Security hardening via linker flags. panic=abort is NOT set here:
+            # [profile.release] in Cargo.toml already aborts for the binaries,
+            # and cargo drops that setting for test targets by itself — as a
+            # RUSTFLAG it applied to the test harness too, which is the only
+            # reason the package build had to skip its own tests.
+            RUSTFLAGS = "-C link-arg=-Wl,-z,relro,-z,now";
           };
 
-          # Tests can't compile with panic=abort in release profile
           cargoArtifacts = craneLib.buildDepsOnly (
             commonArgs // { doCheck = false; }
           );
@@ -66,8 +74,6 @@
           commonArgs
           // {
             inherit cargoArtifacts;
-            # Tests can't compile with panic=abort in release profile
-            doCheck = false;
 
             meta = {
               description = "katagrapho: setuid+setgid binary for tamper-proof session recording with age encryption";
@@ -103,10 +109,10 @@
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
           src = craneLib.cleanCargoSource ./.;
           checkArgs = {
-            inherit src;
+            inherit src version;
             pname = "katagrapho";
-            version = "0.3.0";
             strictDeps = true;
+            KATAGRAPHO_GIT_COMMIT = gitCommit;
           };
           checkArtifacts = craneLib.buildDepsOnly checkArgs;
         in
@@ -117,17 +123,76 @@
             checkArgs
             // {
               cargoArtifacts = checkArtifacts;
-              cargoClippyExtraArgs = "-- --deny warnings";
+              # --all-targets, or the tests themselves are never linted.
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             }
           );
 
-          fmt = craneLib.cargoFmt {
-            inherit src;
-            pname = "katagrapho";
-            version = "0.3.0";
-          };
+          fmt = craneLib.cargoFmt { inherit src version; pname = "katagrapho"; };
 
           tests = craneLib.cargoTest (checkArgs // { cargoArtifacts = checkArtifacts; });
+
+          # checkArgs deliberately omits the package's RUSTFLAGS, so nothing
+          # else here would notice if the hardening flags were dropped.
+          hardening =
+            pkgs.runCommand "katagrapho-hardening" { nativeBuildInputs = [ pkgs.binutils ]; }
+              ''
+                exe=${self.packages.${system}.katagrapho}/bin/katagrapho
+                ${pkgs.binutils}/bin/readelf -dW "$exe" | grep -q BIND_NOW
+                ${pkgs.binutils}/bin/readelf -lW "$exe" | grep -q GNU_RELRO
+                touch $out
+              '';
+
+          # Eval-only, sub-second, no builder. The account-rename class of bug
+          # lives entirely in this module, and `nix flake check` could not see
+          # it: nothing here ever evaluated the module.
+          module-eval =
+            let
+              mk =
+                extra:
+                nixpkgs.lib.nixosSystem {
+                  inherit system;
+                  modules = [
+                    self.nixosModules.katagrapho
+                    extra
+                    {
+                      boot.loader.grub.enable = false;
+                      fileSystems."/" = {
+                        device = "none";
+                        fsType = "tmpfs";
+                      };
+                      system.stateVersion = "25.05";
+                    }
+                  ];
+                };
+              broken = s: builtins.filter (a: !a.assertion) s.config.assertions;
+              ok = mk {
+                services.katagrapho = {
+                  enable = true;
+                  encryption.recipientFile = "/etc/age/recipients.txt";
+                };
+              };
+              # required = true with no recipient file must fail the build.
+              bad = mk { services.katagrapho.enable = true; };
+              wrapper = ok.config.security.wrappers.katagrapho;
+              keygen = ok.config.systemd.services.katagrapho-keygen;
+              rules = ok.config.systemd.tmpfiles.rules;
+            in
+            assert broken ok == [ ];
+            assert builtins.length (broken bad) == 1;
+            assert wrapper.setuid && wrapper.setgid;
+            assert wrapper.owner == "katagrapho";
+            # keygen must be idempotent-by-default (no skip-if-exists) and must
+            # complete before anything that can start a recorded session.
+            assert !(keygen.unitConfig or { } ? ConditionPathExists);
+            assert builtins.elem "sshd.service" keygen.before;
+            assert builtins.elem "multi-user.target" keygen.before;
+            # The corpus migration has to recurse, or it does nothing.
+            assert builtins.any (r: nixpkgs.lib.hasPrefix "Z /var/log/ssh-sessions" r) rules;
+            # Retention must not delete manifests: that is the chain.
+            assert nixpkgs.lib.hasInfix "-name \"*.age\""
+              ok.config.systemd.services.katagrapho-cleanup.serviceConfig.ExecStart;
+            pkgs.runCommand "katagrapho-module-eval" { } "touch $out";
         }
       );
 

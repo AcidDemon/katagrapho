@@ -1,2 +1,6 @@
 /target
 /.worktrees
+/result
+/result-*
+/.serena
+/.ua
