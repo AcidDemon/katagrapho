@@ -60,31 +60,81 @@ pub struct Manifest {
 impl Manifest {
     /// Serialize the manifest in canonical form, EXCLUDING the three
     /// signature-bearing fields. Used as the input to `this_manifest_hash`.
+    ///
+    /// The field order below is explicit and alphabetical, and the object is
+    /// assembled here rather than handed to a `serde_json::Map`. It used to be
+    /// a `json!` literal, which produced these same bytes only because a Map
+    /// is a `BTreeMap` under serde_json's default features and therefore sorts
+    /// its keys. Enabling serde_json's `preserve_order` anywhere in the
+    /// dependency graph would switch that to an `IndexMap`, emit the fields in
+    /// literal order instead, and change every byte: every signature ever
+    /// written would stop verifying, and theatron, which reproduces this
+    /// digest independently, would disagree with the recorder. A canonical
+    /// form cannot depend on a cargo feature.
     fn canonical_bytes_for_hashing(&self) -> Result<Vec<u8>, KatagraphoError> {
-        let json = serde_json::to_string(&serde_json::json!({
-            "v": self.v,
-            "session_id": self.session_id,
-            "part": self.part,
-            "user": self.user,
-            "host": self.host,
-            "boot_id": self.boot_id,
-            "audit_session_id": self.audit_session_id,
-            "started": self.started,
-            "ended": self.ended,
-            "katagrapho_version": self.katagrapho_version,
-            "katagrapho_commit": self.katagrapho_commit,
-            "epitropos_version": self.epitropos_version,
-            "epitropos_commit": self.epitropos_commit,
-            "recording_file": self.recording_file,
-            "recording_size": self.recording_size,
-            "recording_sha256": self.recording_sha256,
-            "chunks": self.chunks,
-            "end_reason": self.end_reason,
-            "exit_code": self.exit_code,
-            "prev_manifest_hash": self.prev_manifest_hash,
-        }))
-        .map_err(|e| KatagraphoError::Manifest(format!("canonical serialize: {e}")))?;
-        Ok(json.into_bytes())
+        fn enc<T: Serialize>(v: &T) -> Result<String, KatagraphoError> {
+            serde_json::to_string(v)
+                .map_err(|e| KatagraphoError::Manifest(format!("canonical serialize: {e}")))
+        }
+
+        // Chunks need the same treatment for the same reason, one level down.
+        // The json! literal turned each Chunk into a Value, so its keys were
+        // sorted too; serializing the struct directly would emit them in
+        // declaration order and change the digest. Alphabetical, explicitly.
+        fn enc_chunks(chunks: &[Chunk]) -> Result<String, KatagraphoError> {
+            let mut out = String::from("[");
+            for (i, c) in chunks.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!(
+                    "{{\"bytes\":{},\"elapsed\":{},\"messages\":{},\"seq\":{},\"sha256\":{}}}",
+                    enc(&c.bytes)?,
+                    enc(&c.elapsed)?,
+                    enc(&c.messages)?,
+                    enc(&c.seq)?,
+                    enc(&c.sha256)?
+                ));
+            }
+            out.push(']');
+            Ok(out)
+        }
+
+        let fields: [(&str, String); 20] = [
+            ("audit_session_id", enc(&self.audit_session_id)?),
+            ("boot_id", enc(&self.boot_id)?),
+            ("chunks", enc_chunks(&self.chunks)?),
+            ("end_reason", enc(&self.end_reason)?),
+            ("ended", enc(&self.ended)?),
+            ("epitropos_commit", enc(&self.epitropos_commit)?),
+            ("epitropos_version", enc(&self.epitropos_version)?),
+            ("exit_code", enc(&self.exit_code)?),
+            ("host", enc(&self.host)?),
+            ("katagrapho_commit", enc(&self.katagrapho_commit)?),
+            ("katagrapho_version", enc(&self.katagrapho_version)?),
+            ("part", enc(&self.part)?),
+            ("prev_manifest_hash", enc(&self.prev_manifest_hash)?),
+            ("recording_file", enc(&self.recording_file)?),
+            ("recording_sha256", enc(&self.recording_sha256)?),
+            ("recording_size", enc(&self.recording_size)?),
+            ("session_id", enc(&self.session_id)?),
+            ("started", enc(&self.started)?),
+            ("user", enc(&self.user)?),
+            ("v", enc(&self.v)?),
+        ];
+
+        let mut out = String::from("{");
+        for (i, (key, value)) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(key);
+            out.push_str("\":");
+            out.push_str(value);
+        }
+        out.push('}');
+        Ok(out.into_bytes())
     }
 
     pub fn compute_hash(&self) -> Result<[u8; 32], KatagraphoError> {
@@ -161,62 +211,16 @@ impl Manifest {
     }
 }
 
-// --- inline base64 (avoids dragging in another dep) ---
-
-fn base64_encode(input: &[u8]) -> String {
-    const ALPH: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
-        out.push(ALPH[(b0 >> 2) as usize] as char);
-        out.push(ALPH[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPH[((b1 & 0x0F) << 2 | b2 >> 6) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(ALPH[(b2 & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+// Signatures are stored as standard (RFC 4648) base64 with padding. The 57
+// hand-rolled lines this replaces produced the same bytes; the base64 crate is
+// already in the lock file via age, so there was nothing to avoid.
+pub fn base64_encode(input: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input)
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    fn val(c: u8) -> Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("invalid base64 char: {c}")),
-        }
-    }
-    let bytes = input.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
-        return Err("base64 length not multiple of 4".to_string());
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let pad = chunk.iter().filter(|&&b| b == b'=').count();
-        let v0 = val(chunk[0])?;
-        let v1 = val(chunk[1])?;
-        let v2 = if pad < 2 { val(chunk[2])? } else { 0 };
-        let v3 = if pad < 1 { val(chunk[3])? } else { 0 };
-        out.push((v0 << 2) | (v1 >> 4));
-        if pad < 2 {
-            out.push((v1 << 4) | (v2 >> 2));
-        }
-        if pad < 1 {
-            out.push((v2 << 6) | v3);
-        }
-    }
-    Ok(out)
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, input)
+        .map_err(|e| format!("invalid base64: {e}"))
 }
 
 #[cfg(test)]
@@ -333,10 +337,95 @@ mod tests {
     }
 
     #[test]
+    fn canonical_bytes_match_the_sorted_map_encoding() {
+        // The bytes every existing signature was computed over. This asserts
+        // the hand-assembled object is byte-identical to what serde_json's
+        // default (BTreeMap-backed) Map produced, so replacing the json!
+        // literal cannot have invalidated anything on disk.
+        let m = sample();
+        let legacy = serde_json::to_string(&serde_json::json!({
+            "v": m.v,
+            "session_id": m.session_id,
+            "part": m.part,
+            "user": m.user,
+            "host": m.host,
+            "boot_id": m.boot_id,
+            "audit_session_id": m.audit_session_id,
+            "started": m.started,
+            "ended": m.ended,
+            "katagrapho_version": m.katagrapho_version,
+            "katagrapho_commit": m.katagrapho_commit,
+            "epitropos_version": m.epitropos_version,
+            "epitropos_commit": m.epitropos_commit,
+            "recording_file": m.recording_file,
+            "recording_size": m.recording_size,
+            "recording_sha256": m.recording_sha256,
+            "chunks": m.chunks,
+            "end_reason": m.end_reason,
+            "exit_code": m.exit_code,
+            "prev_manifest_hash": m.prev_manifest_hash,
+        }))
+        .unwrap();
+        let actual = String::from_utf8(m.canonical_bytes_for_hashing().unwrap()).unwrap();
+        assert_eq!(actual, legacy);
+        // And the order is the alphabetical one, not the listing order.
+        assert!(actual.starts_with("{\"audit_session_id\":"), "{actual}");
+        assert!(
+            actual.ends_with(",\"v\":\"katagrapho-manifest-v1\"}"),
+            "{actual}"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_cover_every_unsigned_field() {
+        // A field added to the struct but not to the canonical encoding would
+        // be unsigned: an attacker could change it freely and the signature
+        // would still verify. Count the struct's fields against the encoding's.
+        let m = sample();
+        let all = match serde_json::to_value(&m).unwrap() {
+            serde_json::Value::Object(o) => o.len(),
+            other => panic!("manifest should serialize to an object, got {other:?}"),
+        };
+        let canonical = match serde_json::from_slice::<serde_json::Value>(
+            &m.canonical_bytes_for_hashing().unwrap(),
+        )
+        .unwrap()
+        {
+            serde_json::Value::Object(o) => o.len(),
+            other => panic!("canonical form should be an object, got {other:?}"),
+        };
+        // this_manifest_hash, key_id and signature are excluded by design.
+        assert_eq!(
+            canonical,
+            all - 3,
+            "every field except the three signature-bearing ones must be signed"
+        );
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        // Existing manifests were signed with a hand-rolled encoder. These are
+        // the RFC 4648 vectors it produced, so a swap that changes a byte here
+        // would invalidate every signature already on disk.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar".to_vec());
+        assert!(base64_decode("not base64!").is_err());
+    }
+
+    #[test]
     fn base64_round_trip() {
         let inputs: &[&[u8]] = &[b"", b"a", b"ab", b"abc", b"abcd", b"hello world"];
         for input in inputs {
             let encoded = base64_encode(input);
+            assert!(
+                !encoded.contains('-') && !encoded.contains('_'),
+                "must stay standard-alphabet base64, not URL-safe: {encoded}"
+            );
             let decoded = base64_decode(&encoded).unwrap();
             assert_eq!(decoded, *input);
         }
