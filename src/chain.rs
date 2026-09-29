@@ -600,6 +600,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_produce_one_unbroken_log() {
+        // Concurrent logins are the normal case on a bastion, and the module
+        // doc claims flock serialises writers, but nothing exercised more than
+        // one. The failure this guards is a lost update: two writers that read
+        // the same tip both link to it, so the log holds two lines claiming the
+        // same predecessor and the chain the whole design rests on has forked.
+        //
+        // flock is held per open file description, so separate acquires from
+        // one process contend exactly as separate processes do.
+        use std::sync::Arc;
+
+        const WRITERS: usize = 8;
+        let dir = tempdir().unwrap();
+        let paths = Arc::new(ChainPaths::under(dir.path()));
+        let kp = Arc::new(key(dir.path()));
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let paths = Arc::clone(&paths);
+                let kp = Arc::clone(&kp);
+                std::thread::spawn(move || {
+                    // The same sequence write_manifest_and_advance performs:
+                    // one lock around reading the tip and advancing both files.
+                    let _lock = ChainLock::acquire(&paths).unwrap();
+                    let manifest_hash = format!("{:064x}", i + 1);
+                    write_head(&paths, &manifest_hash).unwrap();
+                    append_log(
+                        &paths,
+                        "2026-04-07T12:00:00Z",
+                        "u",
+                        &format!("s{i}"),
+                        0,
+                        &manifest_hash,
+                        &kp,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("a writer panicked");
+        }
+
+        // verify_log walks log_prev, so a lost update cannot pass here: the
+        // second writer to link to a reused tip breaks the linkage.
+        let v = verify_log(&paths, &kp.public_bytes()).unwrap();
+        assert_eq!(v.signed_lines, WRITERS, "every writer must appear once");
+        assert_eq!(v.legacy_lines, 0);
+
+        // Whoever appended last must also own head.hash: the two are advanced
+        // under one lock and may not drift apart.
+        assert_eq!(
+            read_head(&paths).unwrap(),
+            v.tip_manifest_hash().unwrap(),
+            "head.hash and the log tip disagree"
+        );
+
+        // All eight manifest hashes are present exactly once, so no writer's
+        // entry was overwritten.
+        let seen: std::collections::HashSet<&str> =
+            v.entries.iter().map(|e| e.manifest_hash.as_str()).collect();
+        assert_eq!(seen.len(), WRITERS);
+    }
+
+    #[test]
     fn append_log_refuses_fields_that_could_forge_a_line() {
         // A username containing a newline would let one append write what
         // reads back as two log lines.
