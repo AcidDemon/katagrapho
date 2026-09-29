@@ -74,6 +74,17 @@ impl KeyPair {
         fs::rename(&key_tmp, key_path)
             .map_err(|e| KatagraphoError::Signing(format!("rename key: {e}")))?;
 
+        let kp = Self { signing, verifying };
+        kp.write_public_to(pub_path)?;
+        Ok(kp)
+    }
+
+    /// Write (or rewrite) the public half. Separate from `generate_to` because
+    /// an interrupted generate can leave the key present and the public key
+    /// missing, which disables verification for the whole host; keygen rebuilds
+    /// it from the private key rather than rotating.
+    #[allow(dead_code)]
+    pub fn write_public_to(&self, pub_path: &Path) -> Result<(), KatagraphoError> {
         let pub_tmp = pub_path.with_extension("tmp");
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -82,15 +93,14 @@ impl KeyPair {
             .mode(0o444)
             .open(&pub_tmp)
             .map_err(|e| KatagraphoError::Signing(format!("open pub tmp: {e}")))?;
-        f.write_all(verifying.as_bytes())
+        f.write_all(self.verifying.as_bytes())
             .map_err(|e| KatagraphoError::Signing(format!("write pub: {e}")))?;
         f.sync_all()
             .map_err(|e| KatagraphoError::Signing(format!("fsync pub: {e}")))?;
         drop(f);
         fs::rename(&pub_tmp, pub_path)
             .map_err(|e| KatagraphoError::Signing(format!("rename pub: {e}")))?;
-
-        Ok(Self { signing, verifying })
+        Ok(())
     }
 
     /// Sign a 32-byte digest. Returns the 64-byte signature.
@@ -138,6 +148,28 @@ mod tests {
         let kp = KeyPair::generate_to(&key_path, &pub_path).unwrap();
         let kp2 = KeyPair::load(&key_path, &pub_path).unwrap();
         assert_eq!(kp.public_bytes(), kp2.public_bytes());
+    }
+
+    #[test]
+    fn public_half_can_be_rebuilt_from_the_key() {
+        // An interrupted generate_to leaves signing.key present and
+        // signing.pub missing. Verification is dead host-wide until it is
+        // rebuilt — and it must rebuild to the SAME key, not a new one.
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("r.key");
+        let pub_path = dir.path().join("r.pub");
+        let kp = KeyPair::generate_to(&key_path, &pub_path).unwrap();
+        let before = kp.public_bytes();
+
+        fs::remove_file(&pub_path).unwrap();
+        let loaded = KeyPair::load(&key_path, &pub_path).unwrap();
+        loaded.write_public_to(&pub_path).unwrap();
+
+        assert_eq!(fs::read(&pub_path).unwrap(), before.to_vec());
+        assert_eq!(
+            KeyPair::load(&key_path, &pub_path).unwrap().public_bytes(),
+            before
+        );
     }
 
     #[test]
