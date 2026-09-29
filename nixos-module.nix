@@ -202,7 +202,14 @@ in
 
     systemd.tmpfiles.rules = [
       "d ${cfg.storageDir} 2750 ${cfg.user} katagrapho-readers -"
-      "d /var/lib/katagrapho 0750 ${cfg.user} katagrapho-readers -"
+      # 2750, setgid, for the same reason as the corpus: head.hash and
+      # head.hash.log are created by the recorder at 0640, and without the
+      # setgid bit they take the recorder's own primary group, so no auditor
+      # could read the truncation anchor. The tmpfiles rules below cannot cover
+      # this on a fresh host — they run at boot, before keygen and before any
+      # recording exists — so the inherited group has to be right by
+      # construction rather than repaired on the next boot.
+      "d /var/lib/katagrapho 2750 ${cfg.user} katagrapho-readers -"
       # Re-chown the recording corpus to katagrapho-readers on every boot so
       # upgrades from a pre-readers-group install take effect without a manual
       # migration. Z, not z: z applies to the named path only, so the per-user
@@ -214,7 +221,10 @@ in
       # pre-existing 0600 anchors from staying root-only after an upgrade.
       "Z /var/lib/katagrapho/head.hash 0640 ${cfg.user} katagrapho-readers -"
       "Z /var/lib/katagrapho/head.hash.log 0640 ${cfg.user} katagrapho-readers -"
-      "Z /var/lib/katagrapho/signing.pub 0640 ${cfg.user} katagrapho-readers -"
+      # 0444: it is a public key. keygen writes it at that mode, and anything
+      # that verifies a recording needs it, including off-host tooling that is
+      # in no group here.
+      "Z /var/lib/katagrapho/signing.pub 0444 ${cfg.user} katagrapho-readers -"
     ];
 
     systemd.services.katagrapho-keygen = {

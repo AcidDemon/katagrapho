@@ -86,11 +86,11 @@ IPC is a stdin pipe. `epitropos` spawns `katagrapho` as a child process and pipe
 
 ```
 /var/log/ssh-sessions/              katagrapho:katagrapho-readers  2750
-/var/log/ssh-sessions/<user>/       katagrapho:katagrapho-readers  0750
+/var/log/ssh-sessions/<user>/       katagrapho:katagrapho-readers  2750
 /var/log/ssh-sessions/<user>/*.age  katagrapho:katagrapho-readers  0440
-/var/lib/katagrapho/                katagrapho:katagrapho-readers  0750
+/var/lib/katagrapho/                katagrapho:katagrapho-readers  2750
 /var/lib/katagrapho/signing.key     katagrapho:katagrapho          0400
-/var/lib/katagrapho/signing.pub     katagrapho:katagrapho-readers  0640
+/var/lib/katagrapho/signing.pub     katagrapho:katagrapho-readers  0444
 /var/lib/katagrapho/head.hash       katagrapho:katagrapho-readers  0640
 /var/lib/katagrapho/head.hash.log   katagrapho:katagrapho-readers  0640
 /run/wrappers/bin/katagrapho        katagrapho:katagrapho          0550 setuid+setgid
