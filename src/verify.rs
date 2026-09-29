@@ -130,7 +130,15 @@ pub fn verify_recursive(
     let mut pruned = 0usize;
     let mut signed: HashSet<PathBuf> = HashSet::new();
     for (sidecar, m) in &entries {
-        m.verify(pub_bytes)?;
+        // Name the file. Without this an auditor looking at a corpus of
+        // thousands gets "manifest content does not match this_manifest_hash"
+        // and no way to tell which recording is in question.
+        m.verify(pub_bytes).map_err(|e| match e {
+            KatagraphoError::Verify(msg) => {
+                KatagraphoError::Verify(format!("{}: {msg}", sidecar.display()))
+            }
+            other => other,
+        })?;
         match recording_for(sidecar, m) {
             Some(recording) => {
                 verify_recording_hash(&recording, m)?;
