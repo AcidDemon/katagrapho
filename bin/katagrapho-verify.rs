@@ -25,22 +25,20 @@ use std::process::exit;
 use crate::error::{EX_NOINPUT, EX_USAGE, KatagraphoError};
 
 const EX_VERIFY_FAIL: i32 = 1;
-#[allow(dead_code)]
-const EX_CHUNK_MISMATCH: i32 = 2;
 const EX_CHAIN_BROKEN: i32 = 3;
 const EX_MANIFEST_MALFORMED: i32 = 4;
 
 fn print_usage() {
     eprintln!(
-        "Usage: katagrapho-verify [--check-chain] [--with-key <age-identity>] [--pub <pubkey>] [--chain-dir <dir>] <path>\n\
+        "Usage: katagrapho-verify [--check-chain] [--pub <pubkey>] [--chain-dir <dir>] <path>\n\
          \n\
          <path> may be a sidecar manifest or a directory of manifests.\n\
          --check-chain also anchors to <chain-dir>/head.hash to detect tail truncation.\n\
+         A directory walk additionally reports recordings that have no manifest.\n\
          \n\
          Exit codes:\n\
            0   verified\n\
-           1   signature mismatch\n\
-           2   chunk hash mismatch (requires --with-key; not yet implemented)\n\
+           1   signature mismatch, recording content mismatch, or unsigned recording\n\
            3   chain broken\n\
            4   manifest malformed\n\
            64  bad CLI args\n\
@@ -52,7 +50,6 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut path: Option<PathBuf> = None;
     let mut check_chain = false;
-    let mut with_key: Option<PathBuf> = None;
     let mut pub_path = PathBuf::from("/var/lib/katagrapho/signing.pub");
     let mut chain_dir = PathBuf::from("/var/lib/katagrapho");
 
@@ -68,10 +65,6 @@ fn main() {
                 exit(0);
             }
             "--check-chain" => check_chain = true,
-            "--with-key" if i + 1 < args.len() => {
-                i += 1;
-                with_key = Some(PathBuf::from(&args[i]));
-            }
             "--pub" if i + 1 < args.len() => {
                 i += 1;
                 pub_path = PathBuf::from(&args[i]);
@@ -84,7 +77,13 @@ fn main() {
                 print_usage();
                 exit(0);
             }
+            // One path per run. Silently keeping the last of several means a
+            // scripted "verify these three" reports success for one of them.
             other if !other.starts_with('-') => {
+                if path.is_some() {
+                    eprintln!("katagrapho-verify: only one <path> may be given");
+                    exit(EX_USAGE);
+                }
                 path = Some(PathBuf::from(other));
             }
             other => {
@@ -124,7 +123,33 @@ fn main() {
     // of the newest manifests) is detectable. read_head returns GENESIS when no
     // head.hash exists yet, which verify_recursive treats as "nothing to anchor".
     let expected_head = if check_chain {
-        match chain::read_head(&chain::ChainPaths::under(&chain_dir)) {
+        let paths = chain::ChainPaths::under(&chain_dir);
+
+        // The log is its own chain, signed line by line. Verify it before the
+        // manifests: it is the only record that survives the manifests being
+        // deleted, so it is the thing an attacker rewrites first.
+        let log = match chain::verify_log(&paths, &pub_arr) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("katagrapho-verify: {e}");
+                exit(EX_CHAIN_BROKEN);
+            }
+        };
+        println!(
+            "katagrapho-verify: chain log: {} signed line(s) verified{}",
+            log.signed_lines,
+            if log.legacy_lines > 0 {
+                format!(
+                    ", {} unsigned legacy line(s) before them (written by a build without log \
+                     signing; unverifiable)",
+                    log.legacy_lines
+                )
+            } else {
+                String::new()
+            }
+        );
+
+        let head = match chain::read_head(&paths) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
@@ -133,7 +158,21 @@ fn main() {
                 );
                 None
             }
+        };
+
+        // head.hash and the log are written under the same lock in the same
+        // transaction, so they cannot legitimately disagree. If they do, one
+        // of the two was edited afterwards.
+        if let (Some(h), Some(tip)) = (head.as_deref(), log.tip_manifest_hash())
+            && h != tip
+        {
+            eprintln!(
+                "katagrapho-verify: head.hash ({h}) does not match the last signed log entry \
+                 ({tip}) — one of the two was rewritten"
+            );
+            exit(EX_CHAIN_BROKEN);
         }
+        head
     } else {
         None
     };
@@ -142,30 +181,49 @@ fn main() {
         match verify::verify_recursive(&path, &pub_arr, check_chain, expected_head.as_deref()) {
             Ok(r) => {
                 println!(
-                    "katagrapho-verify: {} manifests verified{}",
+                    "katagrapho-verify: {} manifests verified{}{}",
                     r.manifests_checked,
-                    if r.chain_walked { " (chain ok)" } else { "" }
+                    if r.chain_walked { " (chain ok)" } else { "" },
+                    if r.recordings_pruned > 0 {
+                        format!(
+                            ", {} recording(s) pruned by retention (sidecar kept, content \
+                             not re-hashable)",
+                            r.recordings_pruned
+                        )
+                    } else {
+                        String::new()
+                    }
                 );
-                Ok(())
+                // Availability-first recording means a missing sidecar is a real
+                // event, not a quirk: report every one and fail, or the operator
+                // learns nothing from a green run.
+                if r.unsigned_recordings.is_empty() {
+                    Ok(())
+                } else {
+                    for p in &r.unsigned_recordings {
+                        eprintln!("katagrapho-verify: UNSIGNED recording {}", p.display());
+                    }
+                    Err(KatagraphoError::Verify(format!(
+                        "{} recording(s) have no manifest — they were written without \
+                         integrity (signing key unreadable at record time?)",
+                        r.unsigned_recordings.len()
+                    )))
+                }
             }
             Err(e) => Err(e),
         }
     } else {
-        verify::verify_single(&path, &pub_arr).map(|_| {
-            println!("katagrapho-verify: ok");
+        verify::verify_single(&path, &pub_arr).map(|c| match c {
+            verify::Content::Verified => println!("katagrapho-verify: ok"),
+            verify::Content::Pruned => println!(
+                "katagrapho-verify: ok (signature valid; recording pruned by retention, \
+                 content not re-hashable)"
+            ),
         })
     };
 
     match result {
-        Ok(()) => {
-            if with_key.is_some() {
-                eprintln!(
-                    "katagrapho-verify: --with-key not yet implemented; chunk hashes \
-                     are committed by the manifest signature already"
-                );
-            }
-            exit(0);
-        }
+        Ok(()) => exit(0),
         Err(KatagraphoError::Verify(msg)) => {
             eprintln!("katagrapho-verify: {msg}");
             exit(EX_VERIFY_FAIL);
