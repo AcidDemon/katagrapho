@@ -71,6 +71,14 @@ impl Manifest {
     /// written would stop verifying, and theatron, which reproduces this
     /// digest independently, would disagree with the recorder. A canonical
     /// form cannot depend on a cargo feature.
+    ///
+    /// The other half of that story runs the opposite way: serde_json's
+    /// default float PARSER is not correctly rounded, so reading back the
+    /// shortest-round-trip text this writes could yield a value 1 ULP off and
+    /// change the digest of `ended`, `started` or a chunk's `elapsed`. Cargo.toml
+    /// therefore enables serde_json/float_roundtrip, and
+    /// `timestamps_survive_the_json_round_trip` fails without it. Anything that
+    /// reproduces this digest in another crate needs that feature too.
     fn canonical_bytes_for_hashing(&self) -> Result<Vec<u8>, KatagraphoError> {
         fn enc<T: Serialize>(v: &T) -> Result<String, KatagraphoError> {
             serde_json::to_string(v)
@@ -165,9 +173,11 @@ impl Manifest {
             ));
         }
         if recomputed[..] != stored[..] {
-            return Err(KatagraphoError::Verify(
-                "manifest content does not match this_manifest_hash".to_string(),
-            ));
+            return Err(KatagraphoError::Verify(format!(
+                "manifest content does not match this_manifest_hash: signed {}, recomputed {}",
+                self.this_manifest_hash,
+                hex::encode(recomputed)
+            )));
         }
         let sig_bytes = base64_decode(&self.signature)
             .map_err(|e| KatagraphoError::Verify(format!("base64 decode sig: {e}")))?;
@@ -334,6 +344,50 @@ mod tests {
         let loaded = Manifest::load_from(&path).unwrap();
         loaded.verify(&kp.public_bytes()).unwrap();
         assert_eq!(loaded.session_id, m.session_id);
+    }
+
+    #[test]
+    fn timestamps_survive_the_json_round_trip() {
+        // Regression test for a signed manifest that verified in memory and
+        // then failed off disk. serde_json's DEFAULT float parser is not
+        // correctly rounded: given the shortest round-trip text the writer
+        // produced, it returned a value 1 ULP away, so the digest recomputed
+        // over the parsed fields differed from the signed one and the recording
+        // became permanently unverifiable. Which timestamps trip it depends on
+        // their digits, so this showed up as roughly one session in four.
+        //
+        // Cargo.toml enables serde_json/float_roundtrip to make parsing exact.
+        // Without that feature this test fails, which is the point.
+        let dir = tempdir().unwrap();
+        let kp =
+            KeyPair::generate_to(&dir.path().join("k.key"), &dir.path().join("k.pub")).unwrap();
+
+        // The first value is the one observed failing in the VM; the rest are
+        // ordinary epoch-with-fraction timestamps of the same shape.
+        for ended in [
+            1790672154.7957637_f64,
+            1790672154.7837212,
+            1790671436.054382,
+            1712534518.551,
+            0.1,
+        ] {
+            let mut m = sample();
+            m.ended = ended;
+            m.sign(&kp).unwrap();
+            let path = dir.path().join("rt.manifest.json");
+            m.write_to(&path).unwrap();
+
+            let loaded = Manifest::load_from(&path).unwrap();
+            assert_eq!(
+                loaded.ended.to_bits(),
+                ended.to_bits(),
+                "ended {ended} did not survive the JSON round trip"
+            );
+            loaded
+                .verify(&kp.public_bytes())
+                .unwrap_or_else(|e| panic!("manifest with ended={ended} failed off disk: {e}"));
+            fs::remove_file(&path).unwrap();
+        }
     }
 
     #[test]
