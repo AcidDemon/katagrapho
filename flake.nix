@@ -143,6 +143,13 @@
                 touch $out
               '';
 
+          # The runtime half of module-eval: a real host, a real setuid
+          # wrapper, real concurrent sessions, real retention.
+          vm-test = import ./tests/vm-katagrapho.nix {
+            inherit pkgs;
+            katagraphoFlake = self;
+          };
+
           # Eval-only, sub-second, no builder. The account-rename class of bug
           # lives entirely in this module, and `nix flake check` could not see
           # it: nothing here ever evaluated the module.
